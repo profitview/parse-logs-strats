@@ -65,9 +65,24 @@ The script only understands alerts in the format below, so this section matters 
 | `1:` | The **signal name**: the strategy name, plus a suffix if the signal is an exit. |
 | `2:` | `#open,high,low,close,volume` of the signal candle, optionally followed by the trade parameters. The **close** price is used as the entry or exit price. |
 
+### Signals sent through Telegram
+
+Commands sent to the Telegram bot are read too:
+
+```
+2026-09-16 23:26:46.590 NOTICE [TelegramBot:110492452] Received commands from @user (...):
+1: EDF3B(e=bybit,s=dogeusdt,res=5m)
+2: #0.08025,0.08044,0.08023,0.08034,3468389,side:1,q:13.1,l:20,tp:0.08215,sl:0.07947
+```
+
+- These headers carry no market, so the market comes from the `s=` parameter. `dogeusdt.p` is read as `DOGEUSDT`. If `s=` is missing, `TELEGRAM_DEFAULT_MARKET` is used. The timeframe comes from `res=` and stays empty if that's missing.
+- Inline parameters may use `key=value` or `key:value`, in any case (`Side=-1`).
+- An **entry** only counts if it has a `2: #...` data line. That keeps chat commands like `Logvars` or `/pos` out of the report. Exits don't need one.
+
 ### Entry and exit signals
 
 - **Entry:** the bare strategy name, e.g. `1: XPX4`. Any signal without an exit suffix counts as an entry.
+- **`!` / `!!` prefix:** tells ProfitView to skip its filtering. The script drops it, so `!XPX4` and `!!XPX4_TP1` count as `XPX4` and `XPX4_TP1`.
 - **Exit:** the strategy name plus one of the suffixes in `EXIT_SUFFIXES`, e.g. `1: XPX4_TP1`, `1: XPX4_SL`. The exit closes the trade that `XPX4` currently has open. An exit with no open trade is ignored.
 - **Flip:** if a strategy sends a new entry while a trade is still open, the open trade is closed as a `FLIP` at the new entry's price, and a new trade opens. See `--no-flips` to filter these instead.
 
@@ -163,6 +178,16 @@ IGNORED_SIGNALS = ("bal", "*_DEBUG", "TEST_*", ...)
 ```
 
 Signals that aren't trades (balance checks, debug alerts, retired test strategies) go here. Entries are case-insensitive glob patterns. The shipped list contains the author's own names; replace it with yours.
+
+### Telegram signals: `TELEGRAM_*`
+
+```python
+TELEGRAM_FIELD_MARKET    = "s"
+TELEGRAM_FIELD_TIMEFRAME = "res"
+TELEGRAM_DEFAULT_MARKET  = "BTCUSDT"
+```
+
+The keys that give a Telegram signal its market and timeframe, and the market used when the key is missing (`None` leaves it unknown).
 
 ### Trade filters
 
@@ -297,9 +322,9 @@ The browser remembers your filters and sort order for the next time you open the
 ## Things to know
 
 - **No match, no numbers.** If a strategy shows trades but `—` for P/L, its alerts are probably missing `side` or `q`, or they use different keys than the `FIELD_*` settings.
-- **Market and timeframe** come from the first entry alert of a strategy. If a strategy later signals on a different market or timeframe, the script prints a warning.
+- **Market and timeframe** come from the first entry signal of a strategy that names them. If a strategy later signals on a different market or timeframe, the script prints a warning. A signal that doesn't name one (e.g. a Telegram command without `res=`) doesn't trigger it.
 - **Open trades** at the end of the log are listed in *Entries* but don't count toward win rate or P/L.
-- **Only alerts are read.** Commands sent in other ways (e.g. through the Telegram bot) don't appear as `Received Alert` entries and are not counted.
+- **Alerts and Telegram commands are read.** Commands sent in any other way are not counted.
 
 ## License
 

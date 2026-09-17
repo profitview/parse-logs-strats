@@ -65,6 +65,18 @@ IGNORED_SIGNALS = (
     "TEST_EXF3B",
 )
 
+# ── Telegram commands ─────────────────────────────────────────────────────────
+# Signals sent through the Telegram bot carry no market/timeframe header; they
+# come from the signal line's inline parameters instead, e.g.
+#   1: EDF3B(e=bybit,s=dogeusdt,res=5m)
+# Keys are matched case-insensitively.
+TELEGRAM_FIELD_MARKET    = "s"
+TELEGRAM_FIELD_TIMEFRAME = "res"
+
+# Market assumed for a Telegram signal without a TELEGRAM_FIELD_MARKET parameter,
+# as a bare symbol like "BTCUSDT". None leaves the market unknown.
+TELEGRAM_DEFAULT_MARKET = "BTCUSDT"
+
 # ── Trade filters ─────────────────────────────────────────────────────────────
 # A trade that breaks one of these rules is treated as an erroneous or stale
 # opening entry and handled according to FILTER_ACTION (the P/L filter always
@@ -155,13 +167,21 @@ HTML_LOGO_HEIGHT_PX       = 34   # rendered height; width follows the 1010x193 r
 
 # Matches the timestamp line above the signal, e.g.:
 #   2026-03-02 19:59:30.857 NOTICE [47162080552] Received Alert (S) for BYBIT:BTCUSDT 5m @ ...
+#   2026-09-16 23:26:46.590 NOTICE [TelegramBot:110492452] Received commands from @user ...
 # The kind (S)/(A) and the market/timeframe are optional groups: a header that
 # does not carry them still has to match, or its signal would be lost entirely.
+# Group 4 is set only for a Telegram header.
 ALERT_HEADER_RE = re.compile(
-    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)\s+NOTICE\b.*Received Alert"
-    r"(?:\s+\([A-Z]\))?"
-    r"(?:\s+for\s+(\S+)\s+(\S+))?"
+    r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)\s+NOTICE\b.*Received\s+(?:"
+    r"Alert(?:\s+\([A-Z]\))?(?:\s+for\s+(\S+)\s+(\S+))?"
+    r"|(commands)\s+from\b)"
 )
+
+# One 'key:value' or 'key=value' item of a parameter list.
+PARAM_RE = re.compile(r"\s*([^:=]+?)\s*[:=](.*)")
+
+# TradingView's perpetual-contract suffix, as in DOGEUSDT.P.
+PERP_SUFFIX = ".P"
 
 # The source system writes this when it has no market to report; it is not a
 # symbol, so it is treated as "unknown" rather than displayed.
@@ -173,8 +193,9 @@ QUOTE_SUFFIX = "USDT"
 
 # Matches the signal line, e.g.:  1: XPX4_TP1   or   1: XPX4(side:1,q:3,l:50)
 # Group 1 is the bare strategy name; group 2 the optional inline parameters,
-# which override same-named parameters from the data line.
-SIGNAL_LINE_RE = re.compile(r"^1:\s+([^\s(]+)(?:\((.*)\))?\s*$")
+# which override same-named parameters from the data line. A leading '!' or '!!'
+# tells the app to skip its filtering; it is not part of the name (!XPX3 = XPX3).
+SIGNAL_LINE_RE = re.compile(r"^1:\s+!{0,2}([^\s(!][^\s(]*)(?:\((.*)\))?\s*$")
 
 # Matches the data line, e.g.:  2: #82674.6,82740.6,82674.6,82730.1,...,side:1,...
 # The parameter tail (group 6) is optional: with inline parameters on the signal
@@ -656,6 +677,20 @@ def parse_timestamp(ts_str: str) -> datetime:
 EMPTY_DATA = {"close": None, "side": None, "qty": None, "lev": None, "tp": None, "sl": None}
 
 
+def split_params(text: Optional[str]) -> dict:
+    """
+    'side:1,Res=5m' -> {'side': '1', 'res': '5m'}. Keys are lowercased, since
+    hand-typed Telegram commands vary in case; items without a separator are
+    skipped. The first ':' or '=' splits, so a value like '1:0' stays whole.
+    """
+    out = {}
+    for part in (text or "").split(","):
+        m = PARAM_RE.match(part)
+        if m:
+            out[m.group(1).lower()] = m.group(2)
+    return out
+
+
 def parse_params(text: Optional[str]) -> dict:
     """
     Parse a 'side:1,q:3,l:50,...' parameter list into data-dict keys.
@@ -665,14 +700,10 @@ def parse_params(text: Optional[str]) -> dict:
     for both the data line's tail and the signal line's inline '(...)' block.
     """
     out = {}
-    if not text:
-        return out
-    wanted = {FIELD_SIDE: "side", FIELD_QTY: "qty", FIELD_LEV: "lev",
-              FIELD_TP: "tp", FIELD_SL: "sl"}
-    for part in text.split(","):
-        key, sep, value = part.partition(":")
-        key = key.strip()
-        if not sep or key not in wanted:
+    wanted = {FIELD_SIDE.lower(): "side", FIELD_QTY.lower(): "qty",
+              FIELD_LEV.lower(): "lev", FIELD_TP.lower(): "tp", FIELD_SL.lower(): "sl"}
+    for key, value in split_params(text).items():
+        if key not in wanted:
             continue
         if wanted[key] == "side":
             side = SIDE_VALUES.get(value.strip().lower())
@@ -739,6 +770,21 @@ def split_market(raw: Optional[str]) -> Optional[str]:
     return raw.split(":")[-1] or None
 
 
+def telegram_market(params: dict) -> Optional[str]:
+    """
+    Market of a Telegram signal from its inline parameters: 'dogeusdt.p' ->
+    'DOGEUSDT', uppercased to match alert headers. Falls back to
+    TELEGRAM_DEFAULT_MARKET when the parameter is absent or empty.
+    """
+    market = split_market(params.get(TELEGRAM_FIELD_MARKET.lower(), "").strip())
+    if not market:
+        return TELEGRAM_DEFAULT_MARKET
+    market = market.upper()
+    if market.endswith(PERP_SUFFIX):
+        market = market[: -len(PERP_SUFFIX)]
+    return market or TELEGRAM_DEFAULT_MARKET
+
+
 def extract_events(files: list[str], show_progress: bool = True) -> list[tuple]:
     """
     Yield (timestamp, signal_token, data, market, timeframe) for every Received
@@ -789,6 +835,18 @@ def extract_events(files: list[str], show_progress: bool = True) -> list[tuple]:
                     elif stripped:
                         # Non-empty line that isn't the data line — stop looking
                         break
+
+                if signal_token and m.group(4):
+                    # Telegram also carries chat commands ('bal', 'Logvars', ...)
+                    # that look like signal names. A real entry always comes with
+                    # a data line; exits often don't, so only entries need one.
+                    if (classify_signal(signal_token)[1] == "ENTRY"
+                            and data["close"] is None):
+                        signal_token = None
+                    else:
+                        params    = split_params(inline)
+                        market    = telegram_market(params)
+                        timeframe = params.get(TELEGRAM_FIELD_TIMEFRAME.lower(), "").strip() or None
 
                 if signal_token:
                     # Inline '(...)' parameters win over the data line's, key by
@@ -920,12 +978,15 @@ def build_trades(events: list[tuple], allow_flips: bool = ALLOW_FLIPS,
             stats[root] = StrategyStats(name=root)
 
         if sig_type == "ENTRY":
-            # First entry signal fixes the strategy's market and timeframe.
-            if stats[root].market is None and stats[root].timeframe is None:
-                stats[root].market    = market
-                stats[root].timeframe = timeframe
-            elif (market, timeframe) != (stats[root].market, stats[root].timeframe):
+            # First entry signal that names a market or timeframe fixes it. A
+            # signal lacking one (e.g. a Telegram command without 'res=') is
+            # unknown there, not a change, so it neither warns nor overrides.
+            s = stats[root]
+            if ((market and s.market and market != s.market)
+                    or (timeframe and s.timeframe and timeframe != s.timeframe)):
                 drifted.setdefault(root, set()).add((market, timeframe))
+            s.market    = s.market or market
+            s.timeframe = s.timeframe or timeframe
 
             if root in open_trade:
                 existing = open_trade.pop(root)
