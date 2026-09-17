@@ -289,6 +289,7 @@ The console also prints a table of time in trade, split into winners and losers,
 - summary tiles (trades, win rate, account P/L, average per trade and per month, time in trade)
 - a sortable strategy table; click a row to see that strategy's equity curve, statistics and trade list
 - a strategy name filter, a date range with quick presets, and a date slider. All figures recalculate for the current selection.
+  The name filter takes a comma-separated list of exact names (case-insensitive) with `*` and `?` wildcards: `xf4` shows only XF4, `*xf4` also shows EXF4, and `exf*, xpx*` shows both families.
 - light and dark themes
 
 The browser remembers your filters and sort order for the next time you open the report.

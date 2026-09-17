@@ -1657,9 +1657,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   <div class="filters">
     <div class="field">
-      <label for="q">Filter by name <span class="hint">— comma = any of</span></label>
+      <label for="q">Filter by name <span class="hint">— comma = any of, * ? = wildcards</span></label>
       <span class="inwrap">
-        <input type="text" id="q" placeholder="e.g. exf, xpx" autocomplete="off" spellcheck="false">
+        <input type="text" id="q" placeholder="e.g. xf4, exf*" autocomplete="off" spellcheck="false">
         <button type="button" class="clearx" id="qclear" hidden
                 title="Clear the name filter (Esc)" aria-label="Clear the name filter">×</button>
       </span>
@@ -1906,19 +1906,23 @@ const $ = id => document.getElementById(id);
 /* ── Filtering ────────────────────────────────────────────────────────────────
    Dates are compared as "YYYY-MM-DD" strings against the pre-computed `day`
    field, which sidesteps timezone drift entirely — no Date objects involved. */
-/* The name box takes a comma-separated list and matches ANY term (OR), so
-   "exf,xpx" shows both families. Empty terms from stray commas are dropped, so
-   a trailing comma while typing does not blank the table. */
+/* The name box takes a comma-separated list and matches ANY term (OR). Each term
+   matches the whole name, case-insensitively, with glob wildcards: * = any run
+   of characters, ? = exactly one. So "xf4" is XF4 only, "*xf4" adds EXF4, and
+   "exf*,xpx*" shows both families — the same syntax as --strat. Empty terms from
+   stray commas are dropped, so a trailing comma while typing does not blank the
+   table. */
 function nameTerms() {
-  return $("q").value.toLowerCase().split(",").map(s => s.trim()).filter(Boolean);
+  return $("q").value.split(",").map(s => s.trim()).filter(Boolean).map(term =>
+    new RegExp("^" + term.replace(/[.+^${}()|[\]\\]/g, "\\$&")
+                         .replace(/\*/g, ".*").replace(/\?/g, ".") + "$", "i"));
 }
 
 function currentTrades() {
   const terms = nameTerms();
   const from = $("from").value, to = $("to").value;
   return TRADES.filter(t => {
-    const name = t.s.toLowerCase();
-    return (!terms.length || terms.some(term => name.includes(term)))
+    return (!terms.length || terms.some(re => re.test(t.s)))
         && (!from || t.day >= from)
         && (!to   || t.day <= to);
   });
