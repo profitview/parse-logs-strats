@@ -234,6 +234,18 @@ HTML_TRADE_CHART   = True
 # milliseconds. Lower feels snappier; higher keeps charts from popping up while
 # you move across the table (only rows rested on this long fetch any candles).
 HTML_CHART_HOVER_MS = 500
+# Where the chart appears:
+#   "hover"  — a popover on the trade row the pointer rests on; a click pins it.
+#   "inline" — a wide chart right above each strategy's trade list, always
+#              shown; it opens on the newest trade and a click on a row picks
+#              another. Hovering then leaves the chart alone.
+HTML_CHART_MODE = "inline"
+HTML_CHART_INLINE_HEIGHT = 300   # px, plot height of the inline chart
+# Context candles fetched before the entry and again after the exit. A minimum:
+# a very short trade gets extra on both sides so the chart shows at least 80
+# candles. The trade itself can span up to 120 candles, and Bybit returns at
+# most 1000 per request, so this is capped at 439.
+HTML_CHART_PAD_BARS = 100
 HTML_CHART_LIB_URL = ("https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.3/"
                       "dist/lightweight-charts.standalone.production.js")
 
@@ -1924,6 +1936,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
      into an ellipse and thicken a vertical stroke. Percent-positioned boxes
      ignore that stretch. */
   .eqplot { position: relative; cursor: crosshair; }
+  .eqplot.eqpick { cursor: pointer; }
   .eqmark { position: absolute; inset: 0; pointer-events: none; }
   .eqband { position: absolute; top: 0; bottom: 0; border-radius: 2px;
             background: color-mix(in srgb, var(--accent) 22%, transparent); }
@@ -1950,6 +1963,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .tipg { display: grid; grid-template-columns: auto auto; gap: 1px 10px; }
   .tipg > span { color: var(--muted); }
   .tipg > b { font-weight: 600; font-variant-numeric: tabular-nums; }
+  .tiphint { display: block; margin-top: 5px; padding-top: 4px;
+             border-top: 1px solid var(--border); color: var(--muted); font-style: italic; }
   .tradewrap tr[data-mx0] { cursor: crosshair; }
   .tradewrap tr.hot > td { background: color-mix(in srgb, var(--accent) 12%, transparent); }
   .tradewrap tr.pinned > td { background: color-mix(in srgb, var(--accent) 20%, transparent); }
@@ -1963,6 +1978,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             border-radius: 10px; box-shadow: var(--shadow); padding: 8px 10px 10px;
             pointer-events: none; font-size: 11.5px; color: var(--text); }
   .tchart.pinned { pointer-events: auto; border-color: var(--accent); }
+  /* Inline variant: the same box, in the page flow above the trade list. */
+  .tchart.tcinline { position: sticky; left: 18px; z-index: auto; width: auto; pointer-events: auto;
+                     box-shadow: none; border-color: var(--border); margin-bottom: 10px; }
+  .tcinline + .tradewrap tr[data-ti] { cursor: pointer; }
   .tchead { display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px; }
   .tchead b { font-weight: 600; }
   .tchead .dim { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1973,7 +1992,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .tcplot { position: relative; height: 260px; }
   .tcmsg { position: absolute; inset: 0; display: flex; align-items: center;
            justify-content: center; text-align: center; color: var(--muted); padding: 0 20px; }
-  .tcmsg:empty { display: none; }             /* else it would sit over the chart */
+  .tcmsg:empty { display: none; }
+  /* Lightweight Charts lays itself out as a <table>; keep the report's own th/td
+     rules (padding, borders, first-column width) from squeezing its canvases. */
+  .tcplot th, .tcplot td { padding: 0; border: 0; width: auto; text-align: left;
+                           white-space: normal; background: none; }             /* else it would sit over the chart */
   .tclegend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 6px; color: var(--muted); }
   .tclegend i { display: inline-block; width: 14px; border-top: 2px solid; vertical-align: middle; margin-right: 5px; }
   .tclegend i.dash { border-top-style: dashed; }
@@ -2091,7 +2114,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <label for="to">Until</label>
       <input type="date" id="to">
     </div>
-    <label class="check" title="Scale the time-in-trade bars logarithmically"><input type="checkbox" id="logscale"> Log-scale time bars</label>
+    <label class="check" title="Scale the time-in-trade bars logarithmically"><input type="checkbox" id="logscale"> Log-scale time</label>
     <label class="check" title="Show a price chart when resting the pointer on a trade (needs a network connection)"><input type="checkbox" id="charts"> Trade charts</label>
     <button class="btn" id="reset">Reset filters</button>
     <span class="pill" id="savedpill" hidden
@@ -2609,13 +2632,22 @@ function bindTradeMarkers(root) {
   closeChart();                                // its row was just replaced
   root.querySelectorAll(".detailbox").forEach(box => {
     // Every row gets the trade chart; only rows placed on the timeline (data-mx0)
-    // also drive the curve marker.
-    box.querySelectorAll("tr[data-ti]").forEach(tr => {
+    // also drive the curve marker. With an inline panel, a click picks the trade
+    // it shows and hovering leaves the chart alone.
+    const inline = box.querySelector(".tcinline");
+    const rows = [...box.querySelectorAll("tr[data-ti]")];
+    rows.forEach(tr => {
       const onCurve = tr.dataset.mx0 !== undefined;
-      tr.onmouseenter = e => { if (onCurve) showMark(box, tr); chartHover(tr, e); };
-      tr.onmouseleave = () => { if (onCurve) clearMark(box); chartLeave(tr); };
-      tr.onclick = e => chartPin(tr, e);
+      tr.onmouseenter = e => { if (onCurve) showMark(box, tr); if (!inline) chartHover(tr, e); };
+      tr.onmouseleave = () => { if (onCurve) clearMark(box); if (!inline) chartLeave(tr); };
+      tr.onclick = e => inline ? selectInline(inline, tr) : chartPin(tr, e);
     });
+    // The viewer's earlier pick if the filters still list it, else the newest trade.
+    if (inline && rows.length) {
+      fitInline();
+      const picked = inlineSel.get(inline.dataset.strat);
+      selectInline(inline, rows.find(tr => TRADES[+tr.dataset.ti] === picked) || rows[0]);
+    }
     // Month columns join in: hovering one marks the first trade counted in that
     // month (if the filter lets it into the table), clicking one filters to it.
     box.querySelectorAll(".mogrid > .mocol").forEach((col, m) => {
@@ -2642,6 +2674,17 @@ function bindTradeMarkers(root) {
       if (tr) { showMark(box, tr); revealRow(box, tr); }
     };
     plot.onmouseleave = () => clearMark(box);
+    // With an inline panel, a click on the curve picks the trade under the
+    // pointer, the same as clicking its row in the table.
+    if (inline) {
+      plot.classList.add("eqpick");
+      plot.onclick = e => {
+        const r = plot.getBoundingClientRect();
+        if (!r.width || !chartsOn()) return;
+        const tr = rowAtX(box, (e.clientX - r.left) / r.width * 100);
+        if (tr) selectInline(inline, tr);
+      };
+    }
   });
 }
 
@@ -2658,13 +2701,23 @@ const TIMEFRAMES  = PAYLOAD.timeframes || {};
 const CHART_DELAY = PAYLOAD.config.chartDelay ?? 250;   // ms of hover before fetching (HTML_CHART_HOVER_MS)
 const CHART_BARS  = 120;    // most candles the trade itself may span before the interval steps up
 const CHART_MIN   = 80;     // fewest candles in view; short trades get more context around them
-const CHART_PAD   = 30;     // candles before entry and after exit, at least
+// Candles before entry and after exit, at least (HTML_CHART_PAD_BARS). Both pads
+// plus the trade's own CHART_BARS must fit Bybit's 1000-candle page.
+const CHART_PAD   = Math.min(PAYLOAD.config.chartPad ?? 30, Math.floor((1000 - CHART_BARS - 1) / 2));
 // Bybit's kline intervals in minutes; 1440 is sent as "D".
 const BYBIT_IVS   = [1, 3, 5, 15, 30, 60, 120, 240, 360, 720, 1440];
 
-let chartEl = null, chartObj = null, chartRow = null, chartX = 0;
-let chartPinned = false, chartTimer = 0, chartSeq = 0, chartLibP = null;
+// "hover": a popover on the hovered/clicked row. "inline": a wide panel above
+// each strategy's trade list, showing the clicked (initially the newest) trade.
+const CHART_MODE  = PAYLOAD.config.chartMode === "inline" ? "inline" : "hover";
+
+// Hover popover state; inline panels keep theirs on the element (see showTradeIn).
+let chartEl = null, chartRow = null, chartX = 0;
+let chartPinned = false, chartTimer = 0, chartLibP = null;
 const candleCache = new Map();
+// Inline mode: the trade each strategy's panel shows, so a re-render (filters,
+// sorting, expanding another strategy) keeps the viewer's pick.
+const inlineSel = new Map();
 
 function loadChartLib() {
   if (!chartLibP) chartLibP = new Promise((ok, fail) => {
@@ -2738,16 +2791,87 @@ function chartBox() {
     chartEl = document.createElement("div");
     chartEl.className = "tchart";
     chartEl.hidden = true;
-    chartEl.innerHTML = `<div class="tchead"><b></b><span class="dim"></span>
-      <button class="tcclose" type="button" title="Close (Esc)">✕</button></div>
-      <div class="tcplot"><div class="tcmsg"></div></div><div class="tclegend"></div>`;
+    chartEl.innerHTML = chartShell(true);
     chartEl.querySelector(".tcclose").onclick = closeChart;
     document.body.appendChild(chartEl);
   }
   return chartEl;
 }
 
-const chartMsg = text => { chartEl.querySelector(".tcmsg").textContent = text; };
+/* Markup shared by the popover and the inline panels. */
+function chartShell(closable, height) {
+  return `<div class="tchead"><b></b><span class="dim"></span>
+      ${closable ? `<button class="tcclose" type="button" title="Close (Esc)">✕</button>` : ""}</div>
+      <div class="tcplot"${height ? ` style="height:${height}px"` : ""}><div class="tcmsg"></div></div>
+      <div class="tclegend"></div>`;
+}
+
+/* Fills a chart host (the popover or an inline panel) with trade t. Each host
+   carries its own chart and request token, so a slow answer for a trade the
+   host has since moved on from is dropped rather than drawn over the new one.
+   `after` runs once the chart is drawn (the popover re-places itself). */
+function showTradeIn(host, t, after) {
+  const seq = host.__seq = (host.__seq || 0) + 1;
+  if (host.__chart) { host.__chart.remove(); host.__chart = null; }
+  host.__trade = t;
+  const msg = text => { host.querySelector(".tcmsg").textContent = text; };
+  const sym = SYMBOLS[t.s];
+  const w = t.e0 == null ? null : chartWindow(t);
+  const ivLabel = !w ? "" : w.iv < 60 ? w.iv + "m" : w.iv < 1440 ? w.iv / 60 + "h" : "1D";
+  host.querySelector(".tchead b").textContent = (sym || t.s) + (w ? ` · ${ivLabel} candles` : "");
+  host.querySelector(".tchead .dim").textContent = `${t.s} · ${t.t0} → ${t.t1 || "open"}`;
+  host.querySelector(".tclegend").innerHTML = "";
+
+  if (!sym) { msg("The log does not say which market this strategy trades."); return; }
+  if (!w)   { msg("This trade has no usable entry time."); return; }
+  msg("Loading chart…");
+  Promise.all([loadChartLib(), fetchCandles(sym, w)])
+    .then(([LWC, candles]) => {
+      if (seq !== host.__seq) return;
+      if (!candles.length) { msg("Bybit has no candles for this period."); return; }
+      msg("");
+      host.__chart = drawTradeChart(LWC, host, t, w, candles);
+      if (after) after();
+    })
+    .catch(err => { if (seq === host.__seq) msg(err.message || String(err)); });
+}
+
+function clearHost(host) {
+  host.__seq = (host.__seq || 0) + 1;
+  if (host.__chart) { host.__chart.remove(); host.__chart = null; }
+  host.__trade = null;
+}
+
+/* Theme colours are read when a chart is drawn, so a theme switch redraws the
+   charts on screen (from the candle cache — no new requests). */
+function redrawCharts() {
+  document.querySelectorAll(".tcinline").forEach(h => { if (h.__trade) showTradeIn(h, h.__trade); });
+  if (chartEl && !chartEl.hidden && chartEl.__trade) showTradeIn(chartEl, chartEl.__trade, placeChart);
+}
+
+/* The detail box is as wide as the strategy table, which can be wider than its
+   horizontally scrolling container — a full-width chart would then hide its
+   price axis off to the right. So the panel takes the visible width, and CSS
+   (sticky, left) keeps it in view when the table is scrolled sideways. */
+function fitInline() {
+  document.querySelectorAll(".tcinline").forEach(h => {
+    const sc = h.closest(".scroll"), box = h.closest(".detailbox");
+    if (!sc || !box) return;
+    const cs = getComputedStyle(box);
+    const pad = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight);
+    h.style.width = Math.min(box.clientWidth, sc.clientWidth) - pad + "px";
+  });
+}
+
+/* Inline mode: show the clicked row's trade in its strategy's panel. */
+function selectInline(host, tr) {
+  const t = TRADES[+tr.dataset.ti];
+  if (!t) return;
+  host.closest(".detailbox").querySelectorAll("tr.pinned").forEach(r => r.classList.remove("pinned"));
+  tr.classList.add("pinned");
+  inlineSel.set(t.s, t);
+  if (host.__trade !== t) showTradeIn(host, t);
+}
 
 /* Off when the viewer unticked "Trade charts", or the report was built without a
    chart library URL. */
@@ -2782,37 +2906,16 @@ function openChart(tr, x, pin) {
   // Hovered, then clicked: the chart on screen is already this trade's.
   if (chartRow === tr && !el.hidden) return;
 
-  const seq = ++chartSeq;                      // results for any earlier row are now stale
-  if (chartObj) { chartObj.remove(); chartObj = null; }
   chartRow = tr;
   chartX = x;
-  const sym = SYMBOLS[t.s];
-  const w = t.e0 == null ? null : chartWindow(t);
-  const ivLabel = !w ? "" : w.iv < 60 ? w.iv + "m" : w.iv < 1440 ? w.iv / 60 + "h" : "1D";
-  el.querySelector(".tchead b").textContent = (sym || t.s) + (w ? ` · ${ivLabel} candles` : "");
-  el.querySelector(".tchead .dim").textContent = `${t.s} · ${t.t0} → ${t.t1 || "open"}`;
-  el.querySelector(".tclegend").innerHTML = "";
   el.hidden = false;
+  showTradeIn(el, t, placeChart);              // re-placed once drawn: the legend adds height
   placeChart();
-
-  if (!sym) { chartMsg("The log does not say which market this strategy trades."); return; }
-  if (!w)   { chartMsg("This trade has no usable entry time."); return; }
-  chartMsg("Loading chart…");
-  Promise.all([loadChartLib(), fetchCandles(sym, w)])
-    .then(([LWC, candles]) => {
-      if (seq !== chartSeq) return;
-      if (!candles.length) { chartMsg("Bybit has no candles for this period."); return; }
-      chartMsg("");
-      drawTradeChart(LWC, t, w, candles);
-      placeChart();                            // the legend may have changed the height
-    })
-    .catch(err => { if (seq === chartSeq) chartMsg(err.message || String(err)); });
 }
 
 function closeChart() {
   clearTimeout(chartTimer);
-  ++chartSeq;
-  if (chartObj) { chartObj.remove(); chartObj = null; }
+  if (chartEl) clearHost(chartEl);
   if (chartRow) chartRow.classList.remove("pinned");
   chartRow = null;
   chartPinned = false;
@@ -2833,7 +2936,7 @@ function placeChart() {
   chartEl.style.left = Math.max(m, Math.min(chartX - w / 2, innerWidth - w - m)) + "px";
 }
 
-function drawTradeChart(LWC, t, w, candles) {
+function drawTradeChart(LWC, host, t, w, candles) {
   const css = getComputedStyle(document.documentElement);
   const v = name => css.getPropertyValue(name).trim();
   const [green, red, muted, accent, text, panel, border] =
@@ -2853,7 +2956,7 @@ function drawTradeChart(LWC, t, w, candles) {
   // so the candles themselves are neutral: hollow up, filled down.
   const outcome = t.w === true ? green : t.w === false ? red : muted;
 
-  const chart = LWC.createChart(chartEl.querySelector(".tcplot"), {
+  const chart = LWC.createChart(host.querySelector(".tcplot"), {
     autoSize: true,
     layout: { background: { type: "solid", color: panel }, textColor: muted, fontSize: 10.5,
               fontFamily: getComputedStyle(document.body).fontFamily },
@@ -2896,21 +2999,21 @@ function drawTradeChart(LWC, t, w, candles) {
   }
   series.setMarkers(markers);                  // already in time order
   chart.timeScale().fitContent();
-  chartObj = chart;
 
   // The chart's own precision rather than fmtPrice(): two decimals flatten every
   // DOGE level to "0.08".
   const fmt = p => p.toLocaleString("en-US", { minimumFractionDigits: prec, maximumFractionDigits: prec });
   const key = (color, label, price, dash) => price === null ? "" :
     `<span><i class="${dash ? "dash" : ""}" style="border-color:${color}"></i>${esc(label)} ${fmt(price)}</span>`;
-  chartEl.querySelector(".tclegend").innerHTML =
+  host.querySelector(".tclegend").innerHTML =
     key(accent, "Entry", t.p0) + key(outcome, "Exit" + (t.x ? ` (${t.x})` : ""), t.p1) +
     key(green, "TP", tp, true) + key(red, "SL", sl, true) +
     (t.mv === null ? "" : `<span style="color:${t.mv >= 0 ? green : red}">Move ${signed(t.mv / 100)}</span>`);
+  return chart;
 }
 
 addEventListener("scroll", placeChart, true);  // capture: the trade table scrolls on its own too
-addEventListener("resize", placeChart);
+addEventListener("resize", () => { placeChart(); fitInline(); });
 document.addEventListener("keydown", e => {
   if (e.key === "Escape" && chartEl && !chartEl.hidden) closeChart();
 });
@@ -2994,7 +3097,11 @@ function placeTip(mark, tr, d) {
       `<span>Entry</span><b>${at(c(TIP.t0), c(TIP.p0))}</b>` +
       `<span>Exit</span><b>${at(c(TIP.t1), c(TIP.p1))}</b>` +
       `<span>P/L</span><b class="${acct ? acct.className : ""}">${c(TIP.acct)}</b>` +
-    `</span>`;
+    `</span>` +
+    // Only promise the click where bindTradeMarkers() wired it up: an inline
+    // panel exists for this strategy.
+    (mark.closest(".detailbox")?.querySelector(".tcinline")
+      ? `<span class="tiphint">Click to see this trade in the preview chart</span>` : "");
 
   // The wrapper is a zero-size anchor carrying the position; the tip flips
   // around it. Keeping the two jobs on separate elements means the vertical
@@ -3446,6 +3553,9 @@ function detailHtml(r, win) {
            monthAttrs(t);
   };
 
+  // Same condition as the inline panel below: only then does a click pick the
+  // trade for the preview chart (hover mode already shows its popover).
+  const inlinePick = CHART_MODE === "inline" && chartsOn() && trades.length;
   const tradeRows = trades.map(({ t, n }) => {
     // Direction arrows stay in the normal text colour on purpose: green/red in
     // this table already means profit/loss, and a green "long" that lost money
@@ -3456,7 +3566,8 @@ function detailHtml(r, win) {
     const pl   = t.w === true ? `<span class="pos">Profit</span>`
                : t.w === false ? `<span class="neg">Loss</span>` : `<span class="dim">—</span>`;
     const size = (t.q !== null && t.l !== null) ? t.q.toFixed(2) + "% × " + t.l : "—";
-    return `<tr${markAttrs(t)} data-ti="${TRADE_IX.get(t)}">
+    const hint = inlinePick ? ` title="${esc(`Trade #${n}\nClick to see this trade in the preview chart`)}"` : "";
+    return `<tr${markAttrs(t)} data-ti="${TRADE_IX.get(t)}"${hint}>
       <td>${n}</td>
       <td>${esc(t.t0)}</td>
       <td>${dir}</td>
@@ -3492,35 +3603,37 @@ function detailHtml(r, win) {
   const lsRatio = sht.n ? (lng.n / sht.n).toFixed(2)
                 : lng.n ? "all long" : "—";
   const lsShare = lng.n + sht.n ? pct(lng.n / (lng.n + sht.n)) + " long" : null;
-  const directionNote = lng.n + sht.n === 0 ? "" : `<div class="chips">
-      ${sideChip("▲ Long", lng)}${sideChip("▼ Short", sht)}
-      ${chip("L/S ratio", lsRatio)}${lsShare ? chip("Mix", lsShare) : ""}
-    </div>`;
+  const directionNote = lng.n + sht.n === 0 ? "" :
+    `${sideChip("▲ Long", lng)}${sideChip("▼ Short", sht)}
+      ${chip("L/S ratio", lsRatio)}${lsShare ? chip("Mix", lsShare) : ""}`;
+
+  const rrNote = r.rr === null ? "" :
+    `${chip("Planned R:R", r.rr.toFixed(2))}
+      ${chip("Median", r.rrMedian.toFixed(2))}
+      ${chip("Range", r.rrMin.toFixed(2) + "–" + r.rrMax.toFixed(2))}
+      ${chip("Avg target", (r.avgReward === null ? "—" : r.avgReward.toFixed(2) + "%"), "g")}
+      ${chip("Avg stop", (r.avgRisk === null ? "—" : r.avgRisk.toFixed(2) + "%"), "r")}`;
 
   return `<div class="detailbox">
     ${eq.html}
     ${monthlyChart(r.name, win)}
-    ${directionNote}
-    <div class="chips">
+    <div class="chips">${directionNote}
       ${chip("TP1", r.tp1, "g")}${chip("Spike", r.spike, "g")}
       ${chip("SL", r.sl, "r")}${chip("Timeout", r.timeout, "r")}${chip("Flip", r.flip, "r")}
       ${chip("Open", r.open)}
     </div>
     <div class="chips">${runningNote}
-      ${r.noPnl ? chip("No q/l data", r.noPnl) : ""}</div>
-    ${r.rr === null ? "" : `<div class="chips">
-      ${chip("Planned R:R", r.rr.toFixed(2))}
-      ${chip("Median", r.rrMedian.toFixed(2))}
-      ${chip("Range", r.rrMin.toFixed(2) + "–" + r.rrMax.toFixed(2))}
-      ${chip("Avg target", (r.avgReward === null ? "—" : r.avgReward.toFixed(2) + "%"), "g")}
-      ${chip("Avg stop", (r.avgRisk === null ? "—" : r.avgRisk.toFixed(2) + "%"), "r")}
-    </div>`}
+      ${r.noPnl ? chip("No q/l data", r.noPnl) : ""}
+      ${rrNote}
+    </div>
     <p class="dtitle">Time in trade by outcome</p>
     <table class="mini">
       <thead><tr><th>Outcome</th><th>N</th><th>Min</th><th>Avg</th><th>Max</th></tr></thead>
       <tbody>${durRow("Profitable", r.durProfit)}${durRow("Losing", r.durLoss)}${durRow("All closed", r.dur)}</tbody>
     </table>
     <p class="dtitle" style="margin-top:16px">Trades (${trades.length})</p>
+    ${inlinePick
+      ? `<div class="tchart tcinline" data-strat="${esc(r.name)}">${chartShell(false, PAYLOAD.config.chartHeight)}</div>` : ""}
     <div class="tradewrap"><table class="mini">
       <thead><tr><th>#</th><th>Entry time</th><th>Dir</th><th>Entry $</th><th>Exit</th>
                  <th>Exit time</th><th>Exit $</th><th>P/L</th><th>Duration</th>
@@ -3573,11 +3686,12 @@ function applyTheme(mode) {
 let themeMode = "auto";
 try { themeMode = localStorage.getItem("pv-theme") || "auto"; } catch (e) {}
 applyTheme(themeMode);
-matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { if (themeMode === "auto") applyTheme("auto"); });
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { if (themeMode === "auto") { applyTheme("auto"); redrawCharts(); } });
 $("theme").onclick = () => {
   themeMode = themeMode === "auto" ? "light" : themeMode === "light" ? "dark" : "auto";
   try { localStorage.setItem("pv-theme", themeMode); } catch (e) {}
   applyTheme(themeMode);
+  redrawCharts();
 };
 
 /* ── Wire up filters ──────────────────────────────────────────────────────── */
@@ -3951,6 +4065,12 @@ def write_html_report(all_stats: dict[str, StrategyStats], out_path: str, files:
     if filtered and filtered.total:
         bits.append(f"{filtered.total} trades filtered ({filtered.describe()})")
 
+    chart_mode = HTML_CHART_MODE
+    if chart_mode not in ("hover", "inline"):
+        print(f"  [WARN] HTML_CHART_MODE {chart_mode!r} is not 'hover' or 'inline'; "
+              f"falling back to 'hover'.", file=sys.stderr)
+        chart_mode = "hover"
+
     if default_sort not in HTML_SORT_COLUMNS:
         print(f"  [WARN] HTML default sort {default_sort!r} is not a known column; "
               f"falling back to 'pnl'. Valid: {', '.join(HTML_SORT_COLUMNS)}", file=sys.stderr)
@@ -3996,6 +4116,9 @@ def write_html_report(all_stats: dict[str, StrategyStats], out_path: str, files:
             "tradeChart":  bool(HTML_TRADE_CHART),
             "chartLib":    HTML_CHART_LIB_URL,
             "chartDelay":  max(0, int(HTML_CHART_HOVER_MS)),
+            "chartMode":   chart_mode,
+            "chartHeight": max(120, int(HTML_CHART_INLINE_HEIGHT)),
+            "chartPad":    max(0, int(HTML_CHART_PAD_BARS)),
         },
         # Per strategy, not per trade: the market and timeframe come from the
         # strategy's first entry signal and are the same for all of its trades,

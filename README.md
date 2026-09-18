@@ -239,7 +239,9 @@ Pick `MAX_TRADE_PNL_PCT` to suit your position sizes and leverage. With high lev
 | `HTML_LOG_SCALE_DURATION` | Start with log-scaled time-in-trade bars |
 | `HTML_LOGO_*` | Logo shown in the page heading. Set to `""` for plain text. |
 | `HTML_TRADE_CHART` | Whether the report's *Trade charts* box starts ticked: a candle chart of the trade when hovering a row in the trade list (needs a network connection) |
-| `HTML_CHART_HOVER_MS` | How long the pointer must rest on a trade row before its chart opens, in milliseconds (default 400) |
+| `HTML_CHART_HOVER_MS` | How long the pointer must rest on a trade row before its chart opens, in milliseconds (default 500) |
+| `HTML_CHART_MODE` | `"hover"`: the chart pops up on the trade row under the pointer. `"inline"`: a wide chart sits above each strategy's trade list, shows the newest trade, and a click on a row picks another |
+| `HTML_CHART_INLINE_HEIGHT` | Height of the inline chart in pixels |
 | `LOG_UTC_OFFSET_HOURS` | Timezone of the log timestamps, used to fetch the right candles. `None` = this computer's local time, including daylight saving |
 
 ## Usage
@@ -345,7 +347,7 @@ The console also prints a table of time in trade, split into winners and losers,
 - a sortable strategy table; click a row to see that strategy's equity curve, statistics and trade list
 - a strategy name filter, a date range with quick presets, and a date slider. All figures recalculate for the current selection.
   The name filter takes a comma-separated list of exact names (case-insensitive) with `*` and `?` wildcards: `xf4` shows only XF4, `*xf4` also shows EXF4, and `exf*, xpx*` shows both families.
-- a price chart for each trade: rest the pointer on a row in the trade list to see the market's candles around the trade, with entry, exit, take-profit and stop-loss marked. Click the row to pin the chart, and press Esc to close it. Untick *Trade charts* next to the filters to turn this off. The candles come live from Bybit's public API, so this part needs a network connection. Strategies on timeframes below 1 minute are shown on 1m candles, and long trades on coarser ones.
+- a price chart for each trade: rest the pointer on a row in the trade list to see the market's candles around the trade, with entry, exit, take-profit and stop-loss marked. Click the row to pin the chart, and press Esc to close it. With `HTML_CHART_MODE = "inline"` the chart sits above the trade list instead: it opens on the newest trade, and clicking a row shows that one. Untick *Trade charts* next to the filters to turn this off. The candles come live from Bybit's public API, so this part needs a network connection. Strategies on timeframes below 1 minute are shown on 1m candles, and long trades on coarser ones.
 - light and dark themes
 
 The browser remembers your filters and sort order for the next time you open the report.
