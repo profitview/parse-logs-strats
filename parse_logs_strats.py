@@ -12,6 +12,7 @@ import sys
 import glob
 import csv
 import json
+import math
 import time
 import shutil
 import fnmatch
@@ -145,16 +146,22 @@ MAX_TRADE_PNL_PCT = 10.0
 FILTER_ACTIONS = ("remove", "sl")
 FILTER_ACTION  = "remove"
 
+# ── Risk-adjusted return ──────────────────────────────────────────────────────
+# Days per year used to annualise the Sortino ratio (daily ratio * sqrt(this)).
+# 365 because crypto trades every calendar day; use 252 for exchange-hours
+# markets. The target (minimum acceptable) return is 0% per day.
+TRADING_DAYS_PER_YEAR = 365
+
 # ── Console report defaults ───────────────────────────────────────────────────
 # Which column the STRATEGY SUMMARY table is sorted by. Must be one of:
 #   name, market, entries, profit, loss, spike, timeout, winrate, rr, pnl, avgPnl,
-#   avgMonth
+#   avgMonth, sortino
 # (the same keys as the HTML report, where the two tables share a column).
 # Strategies with no value for the column always sink to the bottom.
 # Override per run with --sort.
 CONSOLE_SORT_COLUMNS = (
     "name", "market", "entries", "profit", "loss", "spike", "timeout",
-    "winrate", "rr", "pnl", "avgPnl", "avgMonth",
+    "winrate", "rr", "pnl", "avgPnl", "avgMonth", "sortino",
 )
 CONSOLE_DEFAULT_SORT      = "pnl"   # default: compounded account P/L
 CONSOLE_DEFAULT_SORT_DESC = True    # True = highest first (Z→A for text columns)
@@ -162,10 +169,11 @@ CONSOLE_DEFAULT_SORT_DESC = True    # True = highest first (Z→A for text colum
 # ── HTML report defaults ──────────────────────────────────────────────────────
 # Which column the table is sorted by when the page opens. Override per run
 # with --html-sort. Must be one of:
-#   name, entries, profit, loss, spike, timeout, winrate, pnl, avgPnl, avgMonth, dur
+#   name, entries, profit, loss, spike, timeout, winrate, pnl, avgPnl, avgMonth,
+#   sortino, dur
 HTML_SORT_COLUMNS = (
     "name", "entries", "profit", "loss", "spike", "timeout",
-    "winrate", "pnl", "avgPnl", "avgMonth", "dur",
+    "winrate", "pnl", "avgPnl", "avgMonth", "sortino", "dur",
 )
 HTML_DEFAULT_SORT     = "pnl"    # default: compounded account P/L
 HTML_DEFAULT_SORT_DESC = True    # True = highest first
@@ -568,6 +576,55 @@ def monthly_return(total: Optional[float], months: float) -> Optional[float]:
     if growth <= 0:
         return -1.0            # account fully wiped out — no real root exists
     return growth ** (1.0 / months) - 1.0
+
+
+def sortino_days(trades) -> Optional[tuple]:
+    """
+    (first, last) calendar day of the period Sortino ratios are measured over:
+    first entry day to the last entry *or exit* day across all the given trades.
+    Exits count here, unlike in period_months(), because the daily returns are
+    booked on the exit day, and one landing past the last entry must still fall
+    inside the period. Shared by every strategy, like period_months().
+    """
+    days = [t.entry_time.date() for t in trades]
+    days += [t.exit_time.date() for t in trades if t.exit_time]
+    return (min(days), max(days)) if days else None
+
+
+def sortino_ratio(trades, span: Optional[tuple],
+                  days_per_year: float = TRADING_DAYS_PER_YEAR) -> Optional[float]:
+    """
+    Annualised Sortino ratio of a set of trades, with a 0% target return.
+
+    Trades are turned into a daily return series first: each trade's P/L is
+    booked on its exit day, several exits on one day compound, and every other
+    day of `span` (see sortino_days()) is a flat 0%. Counting those quiet days
+    matters — they dilute the mean and the downside alike, so a strategy that
+    trades once a week is not scored as if it traded every day.
+
+        mean     = sum(daily returns) / N
+        downside = sqrt(sum(min(r, 0)^2) / N)
+        sortino  = mean / downside * sqrt(days_per_year)
+
+    Returns None when no trade has a P/L, or when no day lost money: with zero
+    downside the ratio is unbounded, and a number would be meaningless.
+    """
+    daily = {}
+    for t in trades:
+        f = t.pnl_fraction
+        if f is None or t.exit_time is None:
+            continue
+        d = t.exit_time.date()
+        daily[d] = daily.get(d, 1.0) * (1.0 + f)
+    if not daily or span is None:
+        return None
+    first, last = min(span[0], min(daily)), max(span[1], max(daily))
+    n = (last - first).days + 1
+    rets = [g - 1.0 for g in daily.values()]
+    downside = math.sqrt(sum(r * r for r in rets if r < 0) / n)
+    if downside <= 0:
+        return None
+    return (sum(rets) / n) / downside * math.sqrt(days_per_year)
 
 
 @dataclass
@@ -1245,20 +1302,22 @@ def _win_rate(s: StrategyStats) -> Optional[float]:
 
 # Sort key and header label for each CONSOLE_SORT_COLUMNS entry. A metric
 # returning None means "no value", which sorts last in either direction. Metrics
-# also take the report period in months, for the per-month figure.
+# also take the report period in months, for the per-month figure, and the
+# day span Sortino ratios are measured over.
 CONSOLE_SORT_METRICS = {
-    "name":    ("Strategy",    lambda s, months: s.name.upper()),
-    "market":  ("Market",      lambda s, months: s.market_label.upper() or None),
-    "entries": ("Entries",     lambda s, months: s.total),
-    "profit":  ("Profit",      lambda s, months: len(s.profitable_trades)),
-    "loss":    ("Loss",        lambda s, months: len(s.losing_trades)),
-    "spike":   ("Spike",       lambda s, months: len(s.exits_of_type("SPIKE"))),
-    "timeout": ("Timeout",     lambda s, months: len(s.exits_of_type("TIMEOUT"))),
-    "winrate": ("Win%",        lambda s, months: _win_rate(s)),
-    "rr":      ("R:R",         lambda s, months: s.avg_risk_reward),
-    "pnl":     ("Account P/L", lambda s, months: s.total_return),
-    "avgPnl":  ("Avg/trade",   lambda s, months: s.avg_return),
-    "avgMonth": ("Avg/month",  lambda s, months: monthly_return(s.total_return, months)),
+    "name":    ("Strategy",    lambda s, months, span: s.name.upper()),
+    "market":  ("Market",      lambda s, months, span: s.market_label.upper() or None),
+    "entries": ("Entries",     lambda s, months, span: s.total),
+    "profit":  ("Profit",      lambda s, months, span: len(s.profitable_trades)),
+    "loss":    ("Loss",        lambda s, months, span: len(s.losing_trades)),
+    "spike":   ("Spike",       lambda s, months, span: len(s.exits_of_type("SPIKE"))),
+    "timeout": ("Timeout",     lambda s, months, span: len(s.exits_of_type("TIMEOUT"))),
+    "winrate": ("Win%",        lambda s, months, span: _win_rate(s)),
+    "rr":      ("R:R",         lambda s, months, span: s.avg_risk_reward),
+    "pnl":     ("Account P/L", lambda s, months, span: s.total_return),
+    "avgPnl":  ("Avg/trade",   lambda s, months, span: s.avg_return),
+    "avgMonth": ("Avg/month",  lambda s, months, span: monthly_return(s.total_return, months)),
+    "sortino": ("Sortino",     lambda s, months, span: sortino_ratio(s.closed, span)),
 }
 
 
@@ -1272,8 +1331,10 @@ def print_report(all_stats: dict[str, StrategyStats], verbose: bool = False,
     sort_label, metric_fn = CONSOLE_SORT_METRICS[sort_key]
 
     # One shared period for every strategy — see period_months().
-    months = period_months([t for s in all_stats.values() for t in s.trades])
-    metric = lambda s: metric_fn(s, months)
+    all_trades = [t for s in all_stats.values() for t in s.trades]
+    months = period_months(all_trades)
+    span   = sortino_days(all_trades)
+    metric = lambda s: metric_fn(s, months, span)
 
     # Name order first so ties stay deterministic (sorted() is stable), then the
     # chosen column. Missing values are split off rather than given a sentinel,
@@ -1286,13 +1347,14 @@ def print_report(all_stats: dict[str, StrategyStats], verbose: bool = False,
     # ── Summary table ─────────────────────────────────────────────────────────
     # Columns: Strategy | Market | Entries | Profit | Loss | Spike | Timeout | Win% |
     #          R:R (planned) | Account P/L (compounded) | Avg/trade (geometric) |
-    #          Avg/month (geometric, over the shared report period)
+    #          Avg/month (geometric, over the shared report period) |
+    #          Sortino (annualised, daily returns over the shared report period)
     # Entries carries any still-open trades as a parenthesised count, e.g. "27 (1)",
     # which keeps a log discrepancy visible without spending a column on it.
-    C = [14, 12, 10, 7, 6, 6, 8, 7, 6, 12, 11, 11]
+    C = [14, 12, 10, 7, 6, 6, 8, 7, 6, 12, 11, 11, 8]
 
     def summary_row(name, market, entries, profit, loss, spike, timeout, win_pct, rr, pnl, avg_pnl,
-                    avg_month):
+                    avg_month, sortino):
         return (
             f"{str(name):<{C[0]}} "
             f"{str(market):<{C[1]}} "
@@ -1305,18 +1367,21 @@ def print_report(all_stats: dict[str, StrategyStats], verbose: bool = False,
             f"{str(rr):>{C[8]}} "
             f"{str(pnl):>{C[9]}} "
             f"{str(avg_pnl):>{C[10]}} "
-            f"{str(avg_month):>{C[11]}}"
+            f"{str(avg_month):>{C[11]}} "
+            f"{str(sortino):>{C[12]}}"
         )
 
     def fmt_rr(v):
         return f"{v:.2f}" if v is not None else "—"
+
+    fmt_sortino = fmt_rr
 
     def entries_cell(total, n_open):
         return f"{total} ({n_open})" if n_open else str(total)
 
     header = summary_row(
         "Strategy", "Market", "Entries", "Profit", "Loss", "Spike", "Timeout", "Win%",
-        "R:R", "Account P/L", "Avg/trade", "Avg/month",
+        "R:R", "Account P/L", "Avg/trade", "Avg/month", "Sortino",
     )
     sep = "-" * len(header)
 
@@ -1342,7 +1407,8 @@ def print_report(all_stats: dict[str, StrategyStats], verbose: bool = False,
         print(summary_row(s.name, s.market_label, entries_cell(s.total, nopen), np_, nl, nspike, ntout,
                           win_pct, fmt_rr(s.avg_risk_reward),
                           fmt_pct(s.total_return), fmt_pct(s.avg_return),
-                          fmt_pct(monthly_return(s.total_return, months))))
+                          fmt_pct(monthly_return(s.total_return, months)),
+                          fmt_sortino(sortino_ratio(s.closed, span))))
 
         totals["entries"] += s.total
         totals["closed"]  += nc
@@ -1377,12 +1443,17 @@ def print_report(all_stats: dict[str, StrategyStats], verbose: bool = False,
         totals["profit"], totals["loss"], totals["spike"], totals["timeout"],
         total_win, fmt_rr(total_rr), fmt_pct(total_pnl), fmt_pct(total_avg),
         fmt_pct(monthly_return(total_pnl, months)),
+        fmt_sortino(sortino_ratio(all_closed, span)),
     ))
     print("=" * len(header))
     print("  Account P/L is compounded — prod(1 + trade return) - 1 — not a sum of "
           "per-trade percentages.")
     print(f"  Avg/month is the geometric monthly return over the report period "
           f"({months:.2f} month(s), first to last entry day; minimum 1).")
+    if span:
+        print(f"  Sortino is annualised (x sqrt({TRADING_DAYS_PER_YEAR})) from daily returns "
+              f"booked on exit days, target 0%, over {(span[1] - span[0]).days + 1} day(s); "
+              f"'—' = no losing day.")
     n_missing = len([t for t in all_closed if t.pnl_fraction is None])
     if n_missing:
         print(f"  [note] {n_missing} of {len(all_closed)} closed trade(s) lack q:/l: or "
@@ -2024,6 +2095,42 @@ function monthlyReturn(total, months) {
   return growth <= 0 ? -1 : Math.pow(growth, 1 / months) - 1;
 }
 
+/* Annualised Sortino ratio, target 0%. JS twin of sortino_ratio() on the Python
+   side: each trade's P/L is booked on its exit day (same-day exits compound),
+   every other day of `span` — ["YYYY-MM-DD", "YYYY-MM-DD"], see sortinoSpan() —
+   counts as a flat 0%, and the daily ratio is scaled by sqrt(trading days).
+   null when nothing has a P/L or no day lost money (unbounded ratio).        */
+function sortino(trades, span) {
+  const daily = new Map();
+  for (const t of trades) {
+    if (t.pnl === null || t.pnl === undefined || !t.t1) continue;
+    const d = t.t1.slice(0, 10);
+    daily.set(d, (daily.has(d) ? daily.get(d) : 1) * (1 + t.pnl));
+  }
+  if (!daily.size || !span) return null;
+  const keys = [...daily.keys()].sort();
+  const lo = span[0] < keys[0] ? span[0] : keys[0];
+  const hi = span[1] > keys[keys.length - 1] ? span[1] : keys[keys.length - 1];
+  const n = Math.round((Date.parse(hi + "T00:00:00Z") - Date.parse(lo + "T00:00:00Z")) / 86400000) + 1;
+  const rets = [...daily.values()].map(g => g - 1);
+  const downside = Math.sqrt(rets.reduce((a, r) => a + (r < 0 ? r * r : 0), 0) / n);
+  if (!(downside > 0)) return null;
+  return (rets.reduce((a, r) => a + r, 0) / n) / downside * Math.sqrt(PAYLOAD.config.tradingDays);
+}
+
+/* Day span the Sortino ratios are measured over: the view's From (or first entry
+   day) to its To (or last entry day), stretched to the last exit in view — trades
+   are filtered by entry day, so an exit can land after To. Shared by all rows. */
+function sortinoSpan(trades) {
+  const days = trades.map(t => t.day).sort();
+  if (!days.length) return null;
+  let hi = $("to").value || days[days.length - 1];
+  for (const t of trades) if (t.t1 && t.t1.slice(0, 10) > hi) hi = t.t1.slice(0, 10);
+  return [$("from").value || days[0], hi];
+}
+
+function fmtSortino(v) { return v === null || v === undefined ? "—" : v.toFixed(2); }
+
 /* Length of a viewWindow() in fractional months, clamped to at least one. */
 const DAYS_PER_MONTH = 365.25 / 12;
 function windowMonths(win) {
@@ -2071,7 +2178,7 @@ function rrStats(list) {
   };
 }
 
-function aggregate(trades, months) {
+function aggregate(trades, months, span) {
   const by = new Map();
   for (const t of trades) {
     if (!by.has(t.s)) by.set(t.s, []);
@@ -2096,6 +2203,7 @@ function aggregate(trades, months) {
       ...rrStats(list),
       pnl: compoundReturn(closed), avgPnl: geoMean(closed),
       avgMonth: monthlyReturn(compoundReturn(closed), months),
+      sortino: sortino(closed, span),
       best: closed.reduce((a, t) => t.pnl !== null && (a === null || t.pnl > a) ? t.pnl : a, null),
       worst: closed.reduce((a, t) => t.pnl !== null && (a === null || t.pnl < a) ? t.pnl : a, null),
       noPnl: closed.filter(t => t.pnl === null).length,
@@ -2115,12 +2223,13 @@ const COLS = [
   { key: "profit",  label: "Profit",   sort: r => r.profit,             dir: -1 },
   { key: "loss",    label: "Loss",     sort: r => r.loss,               dir: -1 },
   { key: "spike",   label: "Spike",    sort: r => r.spike,              dir: -1 },
-  { key: "timeout", label: "Timeout",  sort: r => r.timeout,            dir: -1 },
+  { key: "timeout", label: "T/O",      title: "Timeout", sort: r => r.timeout,            dir: -1 },
   { key: "winrate", label: "Win rate", sort: r => r.winrate === null ? -1 : r.winrate, dir: -1 },
   { key: "rr",      label: "R:R",      sort: r => r.rr === null ? -Infinity : r.rr, dir: -1 },
   { key: "pnl",     label: "Account P/L", sort: r => r.pnl === null ? -Infinity : r.pnl, dir: -1 },
   { key: "avgPnl",  label: "Avg/trade",   sort: r => r.avgPnl === null ? -Infinity : r.avgPnl, dir: -1 },
   { key: "avgMonth", label: "Avg/month",  sort: r => r.avgMonth === null ? -Infinity : r.avgMonth, dir: -1 },
+  { key: "sortino", label: "Sortino",  sort: r => r.sortino === null ? -Infinity : r.sortino, dir: -1 },
   { key: "dur",     label: "Time in trade (min · avg · max)", sort: r => r.dur ? r.dur.avg : -1, dir: -1 },
 ];
 
@@ -2162,7 +2271,8 @@ function render() {
   const trades = currentTrades();
   const win = viewWindow(trades);
   const months = windowMonths(win);
-  let rows = aggregate(trades, months);
+  const span = sortinoSpan(trades);
+  let rows = aggregate(trades, months, span);
   // A strategy with no closed trades in the window has nothing to rank, chart or
   // compound, so it is never listed. Not optional — every figure below, from the
   // KPI tiles to the footer totals, is computed over the rows that survive here.
@@ -2180,7 +2290,7 @@ function render() {
   renderKpis(rows, trades, months);
   renderHead();
   renderBody(rows, win);
-  renderFoot(rows, months);
+  renderFoot(rows, months, span);
 
   $("count").textContent = rows.length + " strateg" + (rows.length === 1 ? "y" : "ies") +
                            " · " + trades.length + " trade" + (trades.length === 1 ? "" : "s") +
@@ -2230,7 +2340,7 @@ function renderHead() {
   $("head").innerHTML = COLS.map(c => {
     const on = c.key === sortKey;
     const arrow = on ? (sortDir === 1 ? "▲" : "▼") : "↕";
-    return `<th data-key="${c.key}" class="${on ? "sorted" : ""}">${esc(c.label)}<span class="arrow">${arrow}</span></th>`;
+    return `<th data-key="${c.key}" class="${on ? "sorted" : ""}"${c.title ? ` title="${esc(c.title)}"` : ""}>${esc(c.label)}<span class="arrow">${arrow}</span></th>`;
   }).join("");
   $("head").querySelectorAll("th").forEach(th => {
     th.onclick = () => {
@@ -2306,6 +2416,7 @@ function renderBody(rows, win) {
       <td><div class="pl"><span class="num ${plClass(r.pnl)}">${signed(r.pnl)}</span>${plBar(r.pnl, maxAbsPnl)}</div></td>
       <td class="${plClass(r.avgPnl)}">${signed(r.avgPnl)}</td>
       <td class="${plClass(r.avgMonth)}">${signed(r.avgMonth)}</td>
+      <td class="${plClass(r.sortino)}">${fmtSortino(r.sortino)}</td>
       <td>${durCell}</td>
     </tr>`);
 
@@ -2723,7 +2834,7 @@ function detailHtml(r, win) {
   </div>`;
 }
 
-function renderFoot(rows, months) {
+function renderFoot(rows, months, span) {
   const sum = k => rows.reduce((a, r) => a + r[k], 0);
   const closed = sum("closed"), profit = sum("profit");
   const wr = closed ? profit / closed : null;
@@ -2746,6 +2857,7 @@ function renderFoot(rows, months) {
     <td><div class="pl"><span class="num ${plClass(totalPnl)}">${signed(totalPnl)}</span></div></td>
     <td class="${plClass(geoMean(all))}">${signed(geoMean(all))}</td>
     <td class="${plClass(monthlyReturn(totalPnl, months))}">${signed(monthlyReturn(totalPnl, months))}</td>
+    <td class="${plClass(sortino(all, span))}">${fmtSortino(sortino(all, span))}</td>
     <td><div class="dur"${ds ? ` title="min ${esc(fmtDurFull(ds.min))} / avg ${esc(fmtDurFull(ds.avg))} / max ${esc(fmtDurFull(ds.max))}"` : ""}>
         <span class="durtext"><b>${ds ? esc(fmtDur(ds.min)) : "—"}</b> · <b>${ds ? esc(fmtDur(ds.avg)) : "—"}</b> · <b>${ds ? esc(fmtDur(ds.max)) : "—"}</b></span></div></td>
   </tr>`;
@@ -3128,6 +3240,7 @@ def write_html_report(all_stats: dict[str, StrategyStats], out_path: str, files:
             "expandTop":   bool(HTML_EXPAND_TOP_ROW),
             "equityStart": HTML_EQUITY_START,
             "logScale":    bool(HTML_LOG_SCALE_DURATION),
+            "tradingDays": TRADING_DAYS_PER_YEAR,
             "defaultFrom": default_from,      # "" = earliest day in the data
         },
         # Per strategy, not per trade: the market and timeframe come from the
@@ -3174,6 +3287,7 @@ CSV_COLUMNS = (
     "entry_time", "entry_price", "exit_time", "exit_price", "exit_type",
     "duration_s", "duration", "profitable", "price_move_pct", "pnl_pct",
     "qty_pct", "leverage", "tp_price", "sl_price", "reward_pct", "risk_pct", "risk_reward",
+    "strategy_sortino",
 )
 
 
@@ -3183,6 +3297,10 @@ def write_csv_report(all_stats: dict[str, StrategyStats], out_path: str) -> int:
     (exit_type FLIP) plus a separate row for the trade it opened. Still-open
     trades have empty exit columns. Numbers are written unformatted so they stay
     machine-readable; returns the number of rows written.
+
+    strategy_sortino is a per-strategy figure, repeated on each of its trades so
+    the file stays a single flat table; it is measured over the same shared
+    period as the console report.
     """
     def num(v):
         return "" if v is None else v
@@ -3191,8 +3309,11 @@ def write_csv_report(all_stats: dict[str, StrategyStats], out_path: str) -> int:
         # Derived ratios carry float noise (1.2200000000000015); prices are left as logged.
         return "" if v is None else round(v, 6)
 
+    span = sortino_days([t for s in all_stats.values() for t in s.trades])
+
     rows = []
     for s in all_stats.values():
+        sortino = calc(sortino_ratio(s.closed, span))
         for t in s.trades:
             dur = t.duration_seconds
             rows.append({
@@ -3217,6 +3338,7 @@ def write_csv_report(all_stats: dict[str, StrategyStats], out_path: str) -> int:
                 "reward_pct":     calc(t.reward_pct),
                 "risk_pct":       calc(t.risk_pct),
                 "risk_reward":    calc(t.risk_reward),
+                "strategy_sortino": sortino,
             })
     rows.sort(key=lambda r: (r["entry_time"], r["strategy"]))
 

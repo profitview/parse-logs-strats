@@ -140,6 +140,7 @@ Trades **compound**; they are not added up. A +50% trade followed by a −50% tr
 
 - **Avg/trade** is the geometric mean: the constant per-trade return that compounds to the same total.
 - **Avg/month** is the same idea per month. It is measured over the report period (first to last entry day, or the selected date range in the HTML report; minimum one month), and every strategy uses that same period.
+- **Sortino** is the annualised Sortino ratio with a 0% target. Each trade's P/L is booked on its exit day, and every day of the report period with no exits counts as 0%. The result is mean daily return ÷ downside deviation × √`TRADING_DAYS_PER_YEAR` (365 by default; set in the configuration block). It shows "—" when no day lost money, because the ratio has no upper bound then. In the CSV it is the `strategy_sortino` column, repeated on each of the strategy's trades.
 
 Each strategy's P/L is calculated as if it had the account to itself. The TOTAL row compounds every trade of every strategy together.
 
@@ -261,9 +262,9 @@ Dates can be written as `YYYY-MM-DD`, `YY-MM-DD` or `MM-DD` (current year).
 | Flag | Description |
 | ---- | ----------- |
 | `-v`, `--verbose` | Also print every individual trade after the summary tables. |
-| `--sort COL` | Sort column of the console table: `name`, `market`, `entries`, `profit`, `loss`, `spike`, `timeout`, `winrate`, `rr`, `pnl`, `avgPnl`, `avgMonth`. |
+| `--sort COL` | Sort column of the console table: `name`, `market`, `entries`, `profit`, `loss`, `spike`, `timeout`, `winrate`, `rr`, `pnl`, `avgPnl`, `avgMonth`, `sortino`. |
 | `--html [FILE]` | Also write the interactive HTML report. Default file: `profitview-report.html`. |
-| `--html-sort COL` | Initial sort column of the HTML table: `name`, `entries`, `profit`, `loss`, `spike`, `timeout`, `winrate`, `pnl`, `avgPnl`, `avgMonth`, `dur`. |
+| `--html-sort COL` | Initial sort column of the HTML table: `name`, `entries`, `profit`, `loss`, `spike`, `timeout`, `winrate`, `pnl`, `avgPnl`, `avgMonth`, `sortino`, `dur`. |
 | `--html-from DATE\|PRESET` | Initial "From" filter of the HTML report: a date or a preset (`7d`, `31d`, `3m`, `6m`, `month`, `quarter`, `year`). Pass `""` for the full range. |
 | `--open` | Open the HTML report in your default browser. |
 | `--csv [FILE]` | Also export every trade (after all filters) to CSV. Default file: `profitview-trades.csv`. |
