@@ -78,6 +78,8 @@ Commands sent to the Telegram bot are read too:
 - These headers carry no market, so the market comes from the `s=` parameter. `dogeusdt.p` is read as `DOGEUSDT`. If `s=` is missing, `TELEGRAM_DEFAULT_MARKET` is used. The timeframe comes from `res=` and stays empty if that's missing.
 - Inline parameters may use `key=value` or `key:value`, in any case (`Side=-1`).
 - An **entry** only counts if it has a `2: #...` data line. That keeps chat commands like `Logvars` or `/pos` out of the report. Exits don't need one.
+- A manually sent **entry** that only repeats an alert already in the log is ignored, so it doesn't open a second trade. See `TELEGRAM_DEDUPE_SECONDS`.
+- A manually sent **exit** usually has no data line and therefore no exit price. In that case the script looks ahead in the log for the `markPrice` of the position query that ProfitView runs right after, and uses it as the exit price. See `TELEGRAM_MARK_PRICE_*`.
 
 ### Entry and exit signals
 
@@ -182,12 +184,36 @@ Signals that aren't trades (balance checks, debug alerts, retired test strategie
 ### Telegram signals: `TELEGRAM_*`
 
 ```python
-TELEGRAM_FIELD_MARKET    = "s"
-TELEGRAM_FIELD_TIMEFRAME = "res"
-TELEGRAM_DEFAULT_MARKET  = "BTCUSDT"
+TELEGRAM_FIELD_MARKET       = "s"
+TELEGRAM_FIELD_TIMEFRAME    = "res"
+TELEGRAM_DEFAULT_MARKET     = "BTCUSDT"
+TELEGRAM_MARK_PRICE_LINES   = 150
+TELEGRAM_MARK_PRICE_SECONDS = 300
 ```
 
-The keys that give a Telegram signal its market and timeframe, and the market used when the key is missing (`None` leaves it unknown).
+The first three are the keys that give a Telegram signal its market and timeframe, and the market used when the key is missing (`None` leaves it unknown).
+
+The last two control the exit price of a manual exit, which arrives without a candle. The script then searches the next `TELEGRAM_MARK_PRICE_LINES` log lines for a `markPrice`, and accepts it only if its `symbol` matches the signal's market and the line is stamped no more than `TELEGRAM_MARK_PRICE_SECONDS` after the command. Set the line count to `0` to switch the fallback off.
+
+The window is meant to reach past the command's own output, because the position query sometimes belongs to the next command a few seconds later. The symbol and age checks are what keep the search honest: the log is full of mark prices for other instruments, and a quiet log can put the next query hours later.
+
+### Repeated signals: `TELEGRAM_DEDUPE_SECONDS`, `DUPLICATE_ALERT_SECONDS`
+
+```python
+TELEGRAM_DEDUPE_SECONDS = 3600
+DUPLICATE_ALERT_SECONDS = 5
+```
+
+The same signal sometimes reaches the log twice. Left alone, the second copy opens a new trade and closes the first as a `FLIP` at the same price, which shows up as a zero-length trade at 0% P/L. Two cases, each with its own test:
+
+| Setting | Case | Matched on |
+| ------- | ---- | ---------- |
+| `TELEGRAM_DEDUPE_SECONDS` | An alert that was disabled in ProfitView fired anyway, and you re-sent it by hand through Telegram with the payload pasted in. | Name, side, price, size, TP **and** SL — the copy is identical, and the gap can be up to an hour. Only the Telegram copy is dropped. |
+| `DUPLICATE_ALERT_SECONDS` | The same alert is configured twice in TradingView, so it fires twice for the same bar. | Name, side and price only, since the two copies are computed moments apart and their size and levels can differ slightly. |
+
+Set either to `0` to switch that case off.
+
+**Keep `DUPLICATE_ALERT_SECONDS` small.** It ignores most of the payload, so the tiny window is what stops it from swallowing genuine signals. Repeats arrive within a second of each other; widening it toward one bar's length would start eating real entries at an unchanged price.
 
 ### Trade filters
 

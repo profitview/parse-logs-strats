@@ -77,6 +77,43 @@ TELEGRAM_FIELD_TIMEFRAME = "res"
 # as a bare symbol like "BTCUSDT". None leaves the market unknown.
 TELEGRAM_DEFAULT_MARKET = "BTCUSDT"
 
+# A manually sent exit carries no candle, so it has no exit price. ProfitView
+# usually queries the position right after, and that response's 'markPrice' is
+# within a few ticks of where the position actually closed. This is how many log
+# lines after the command are searched for one; 0 turns the fallback off.
+# The window deliberately reaches past the end of the command's own output: the
+# position query sometimes belongs to the next command a few seconds later. Only
+# a markPrice whose symbol matches the signal's market is accepted, so a wide
+# window cannot pick up an unrelated instrument's price.
+TELEGRAM_MARK_PRICE_LINES = 150
+
+# ...and how old that mark price may be, in seconds. A quiet log can put the next
+# position query minutes or hours later, where the price says nothing about the
+# exit any more; the line window alone does not catch that.
+TELEGRAM_MARK_PRICE_SECONDS = 300
+
+# An alert that was disabled in ProfitView still fires and is logged, and is then
+# often re-sent by hand through Telegram with the same payload pasted in. That is
+# one signal, not two, but it would otherwise open a second trade and close the
+# first as a FLIP seconds later. Within this many seconds, a Telegram signal that
+# repeats an earlier one — same name, side, price, size, TP and SL — is dropped.
+# Requiring the whole payload to match is what makes a window this wide safe: a
+# genuine second signal at the very same price, size and levels does not happen.
+# 0 turns the de-duplication off.
+TELEGRAM_DEDUPE_SECONDS = 3600
+
+# ── Repeated alerts ───────────────────────────────────────────────────────────
+# An alert configured twice in TradingView fires twice for the same bar, a
+# fraction of a second apart and from two alert IDs. ProfitView acts on the first
+# and its filters swallow the rest, so a repeat within this many seconds — same
+# name, side and price — is dropped here too. Unlike the Telegram case the rest
+# of the payload is not compared: the two copies are computed moments apart, so
+# size and levels can differ slightly.
+# This is why the window must stay tiny. Every repeat in the author's log arrived
+# within 0.8s, which is far below even a 1m bar; widening it towards one bar
+# would start swallowing genuine signals at an unchanged price.
+DUPLICATE_ALERT_SECONDS = 5
+
 # ── Trade filters ─────────────────────────────────────────────────────────────
 # A trade that breaks one of these rules is treated as an erroneous or stale
 # opening entry and handled according to FILTER_ACTION (the P/L filter always
@@ -182,6 +219,16 @@ PARAM_RE = re.compile(r"\s*([^:=]+?)\s*[:=](.*)")
 
 # TradingView's perpetual-contract suffix, as in DOGEUSDT.P.
 PERP_SUFFIX = ".P"
+
+# 'markPrice: 64140.95' and 'symbol: BTCUSDT' in an exchange response, which the
+# log prints either as one line per field or as one line per position. Both
+# layouts put the symbol before the mark price.
+MARK_PRICE_RE = re.compile(r"\bmarkPrice:\s*([0-9]*\.?[0-9]+)")
+SYMBOL_RE     = re.compile(r"\bsymbol:\s*([^\s,]+)")
+
+# Leading timestamp of a log line. Response bodies are printed over many
+# unstamped continuation lines, so the last match is the time of what follows.
+LINE_TS_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+)")
 
 # The source system writes this when it has no market to report; it is not a
 # symbol, so it is treated as "unknown" rather than displayed.
@@ -785,6 +832,46 @@ def telegram_market(params: dict) -> Optional[str]:
     return market or TELEGRAM_DEFAULT_MARKET
 
 
+def find_mark_price(lines: list[str], start: int, market: Optional[str],
+                    ts: Optional[datetime] = None,
+                    window: int = TELEGRAM_MARK_PRICE_LINES,
+                    max_age: Optional[float] = TELEGRAM_MARK_PRICE_SECONDS) -> Optional[float]:
+    """
+    First 'markPrice' for `market` in the `window` lines after `start`, or None.
+
+    Used as the exit price of a manually sent exit, which has no candle of its
+    own. Two things keep an unrelated price out:
+
+      * the symbol. The log is full of mark prices for other instruments (whole
+        ticker dumps), so a price only counts once a 'symbol' line has named the
+        market we are after — which works for both layouts the exchange
+        responses come in, since each prints the symbol before the mark price.
+      * the time. Scanning stops at the first line stamped more than `max_age`
+        seconds after `ts`, since by then the price has moved on. Pass ts=None
+        or max_age=None to search the whole window regardless of age.
+    """
+    if not market or window <= 0:
+        return None
+    symbol = None
+    for line in lines[start:start + window]:
+        if ts is not None and max_age is not None:
+            m = LINE_TS_RE.match(line)
+            if m and (parse_timestamp(m.group(1)) - ts).total_seconds() > max_age:
+                return None
+        m = SYMBOL_RE.search(line)
+        if m:
+            symbol = (split_market(m.group(1)) or "").upper()
+        if symbol != market:
+            continue
+        m = MARK_PRICE_RE.search(line)
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                pass
+    return None
+
+
 def extract_events(files: list[str], show_progress: bool = True) -> list[tuple]:
     """
     Yield (timestamp, signal_token, data, market, timeframe) for every Received
@@ -793,6 +880,9 @@ def extract_events(files: list[str], show_progress: bool = True) -> list[tuple]:
     the signal line ('1: NAME(side:1,q:3,...)'). `market` is the bare symbol, with the
     exchange stripped; both it and `timeframe` are None when the header did not
     carry them.
+
+    A Telegram signal that only repeats an alert already in the list is dropped
+    on the way out; see drop_duplicates().
 
     The progress bar is sized in bytes rather than lines so it can be set up
     before anything is read; character counts are trued up to the real file size
@@ -821,6 +911,7 @@ def extract_events(files: list[str], show_progress: bool = True) -> list[tuple]:
                 signal_token = None
                 inline       = None
                 data         = dict(EMPTY_DATA)
+                header_i     = i
 
                 for j in range(i + 1, min(i + 15, len(lines))):
                     stripped = lines[j].strip()
@@ -840,19 +931,24 @@ def extract_events(files: list[str], show_progress: bool = True) -> list[tuple]:
                     # Telegram also carries chat commands ('bal', 'Logvars', ...)
                     # that look like signal names. A real entry always comes with
                     # a data line; exits often don't, so only entries need one.
-                    if (classify_signal(signal_token)[1] == "ENTRY"
-                            and data["close"] is None):
+                    is_entry = classify_signal(signal_token)[1] == "ENTRY"
+                    if is_entry and data["close"] is None:
                         signal_token = None
                     else:
                         params    = split_params(inline)
                         market    = telegram_market(params)
                         timeframe = params.get(TELEGRAM_FIELD_TIMEFRAME.lower(), "").strip() or None
+                        # Manually sent exit, hence no candle: fall back to the
+                        # mark price of the position query that follows it.
+                        if not is_entry and data["close"] is None:
+                            data["close"] = find_mark_price(lines, header_i + 1, market, ts)
 
                 if signal_token:
                     # Inline '(...)' parameters win over the data line's, key by
                     # key; the close price only ever comes from the data line.
                     data.update(parse_params(inline))
-                    events.append((ts, signal_token, data, market, timeframe))
+                    events.append((ts, signal_token, data, market, timeframe,
+                                   bool(m.group(4))))
 
             i += 1
 
@@ -875,7 +971,59 @@ def extract_events(files: list[str], show_progress: bool = True) -> list[tuple]:
 
     bar.close()
     events.sort(key=lambda e: e[0])
-    return events
+    return drop_duplicates(events)
+
+
+def drop_duplicates(events: list[tuple],
+                    telegram_window: float = TELEGRAM_DEDUPE_SECONDS,
+                    repeat_window: float = DUPLICATE_ALERT_SECONDS) -> list[tuple]:
+    """
+    Drop signals that only repeat an earlier one, and strip the is-Telegram flag
+    from the 6-tuples extract_events() collects.
+
+    Taken at face value a repeat opens a second trade and closes the first as a
+    FLIP at the same price, which shows up in the report as a zero-length trade
+    at 0% P/L. Two kinds occur, and they need different tests:
+
+      * A disabled alert still fires and is logged; re-sending it by hand through
+        Telegram logs the same signal again, with the payload pasted in unchanged
+        and only '(e=bybit)' added. Here the whole payload is compared — name,
+        side, price, size, TP and SL — because the copy is identical and the gap
+        can be an hour. Only the Telegram copy is dropped: the alert is what
+        actually ran, and if the alert was disabled, the Telegram copy is the
+        first of its payload and is kept.
+      * An alert configured twice in TradingView fires twice for the same bar,
+        within a second. Those copies are computed moments apart, so only name,
+        side and price are compared — but within a window small enough that
+        nothing but a repeat can fall inside it.
+    """
+    def payload(token: str, data: dict) -> tuple:
+        return (token.upper(), data["side"], data["close"],
+                data["qty"], data["tp"], data["sl"])
+
+    keep_ms = max(telegram_window, repeat_window)
+    kept, recent = [], []     # recent: (ts, payload) of signals still in window
+    for ev in events:
+        ts, token, data, _, _, telegram = ev
+        recent = [r for r in recent if r[0] >= ts - timedelta(seconds=keep_ms)]
+        this = payload(token, data)
+        # A payload of all-Nones carries nothing to compare, so it never matches.
+        if any(v is not None for v in this[1:]):
+            dupe = False
+            for old_ts, old in recent:
+                age = (ts - old_ts).total_seconds()
+                if telegram and telegram_window > 0 and age <= telegram_window \
+                        and old == this:
+                    dupe = True
+                elif repeat_window > 0 and age <= repeat_window and old[:3] == this[:3]:
+                    dupe = True
+                if dupe:
+                    break
+            if dupe:
+                continue
+        recent.append((ts, this))
+        kept.append(ev[:5])
+    return kept
 
 
 def is_ignored_signal(token: str) -> bool:
