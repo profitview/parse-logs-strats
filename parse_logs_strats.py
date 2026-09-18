@@ -51,6 +51,7 @@ EXIT_SUFFIXES = ("_TP1", "_SPIKE", "_SL", "_TIMEOUT")
 IGNORED_SIGNALS = (
     "bal",
     "foo",
+    "foobla",
     "*_DEBUG",
     "*_FILTER",
     "*_FILTERED",
@@ -179,6 +180,10 @@ HTML_DEFAULT_SORT     = "pnl"    # default: compounded account P/L
 HTML_DEFAULT_SORT_DESC = True    # True = highest first
 HTML_EXPAND_TOP_ROW   = True     # expand the leading strategy's detail on load
 HTML_EQUITY_START     = 100.0    # starting balance for the equity curve
+HTML_EQUITY_HEIGHT    = 150      # px, plot height of the account balance chart
+HTML_MONTHLY_HEIGHT   = 118      # px, plot height of the monthly P/L columns (month
+                                 # names below it are extra); 15px of it is kept free
+                                 # top and bottom for the % labels. Both minimum 60.
 HTML_LOG_SCALE_DURATION = True   # start with log-scaled duration bars (trade times
                                  # span seconds to weeks, which a linear bar squashes)
 
@@ -189,13 +194,18 @@ HTML_LOG_SCALE_DURATION = True   # start with log-scaled duration bars (trade ti
 # "" means the earliest day in the data, i.e. show everything. A date before the
 # data starts is clamped to the first day; one after it ends is rejected with a
 # warning, since it would open the report on an empty table.
+# Only the From date is taken from a preset — Until always opens on the last day
+# — so "lastyear" here means "from Jan 1 of last year up to today", and "all" is
+# the same as "".
 # "Reset filters" returns here, not to the full range. Override per run with
 # --html-from (pass --html-from "" to open on the full range).
 HTML_DEFAULT_FROM_DATE = "6m"
 
 # The value="…" keys of the report's Quick range dropdown, as understood by
 # presetRange() in the page script. Keep the three in sync.
-HTML_FROM_PRESETS = ("7d", "31d", "3m", "6m", "month", "quarter", "year")
+HTML_FROM_PRESETS = ("all", "7d", "31d", "3m", "6m", "month", "quarter", "year", "lastyear",
+                     "jan", "feb", "mar", "apr", "may", "jun",
+                     "jul", "aug", "sep", "oct", "nov", "dec")
 
 # Logo shown in place of the word "ProfitView" in the page heading. Two files,
 # because the artwork has to invert with the theme. Set either to "" to fall
@@ -204,6 +214,9 @@ HTML_FROM_PRESETS = ("7d", "31d", "3m", "6m", "month", "quarter", "year")
 HTML_LOGO_FOR_LIGHT_THEME = "https://profitview.app/logo/logo-wide-dark-trans.png"
 HTML_LOGO_FOR_DARK_THEME  = "https://profitview.app/logo/logo-wide-bright-trans.png"
 HTML_LOGO_HEIGHT_PX       = 34   # rendered height; width follows the 1010x193 ratio
+HTML_LOGO_LINK            = "https://profitview.app"   # the logo links here ("" = no link)
+# Linked from "by parse_logs_strats.py" in the page footer ("" = plain text).
+HTML_SOURCE_LINK          = "https://github.com/profitview/parse-logs-strats"
 
 # ══ END CONFIGURATION ═════════════════════════════════════════════════════════
 
@@ -1673,6 +1686,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   }
   :root[data-theme="dark"] .logo-light { display: none; }
   :root[data-theme="dark"] .logo-dark  { display: block; }
+  .brandlink { display: flex; color: inherit; text-decoration: none; border-radius: 4px; }
+  .brandlink:hover { opacity: .85; }
+  .brandlink:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
   .sub { color: var(--muted); font-size: 12.5px; }
   .spacer { flex: 1 1 auto; }
 
@@ -1773,7 +1789,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     padding: 7px 10px; min-width: 150px; outline: none; cursor: pointer;
   }
   .presetfield select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent); }
-  .presetfield select option { background: var(--panel); color: var(--text); }
+  .presetfield select option, .presetfield select optgroup { background: var(--panel); color: var(--text); }
   .check { display: inline-flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12.5px; padding-bottom: 8px; cursor: pointer; }
   .count { color: var(--muted); font-size: 12.5px; padding-bottom: 8px; }
   .hint { color: var(--muted); text-transform: none; letter-spacing: 0; font-size: 10.5px; }
@@ -1848,7 +1864,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .detailbox { padding: 16px 18px 18px; border-bottom: 1px solid var(--border);
                white-space: normal; }
   /* ── Equity curve ─────────────────────────────────────────
-     The SVG uses a fixed 800x150 viewBox stretched to the container with
+     The SVG uses an 800 x HTML_EQUITY_HEIGHT viewBox stretched to the container with
      preserveAspectRatio="none"; every stroke carries vector-effect:
      non-scaling-stroke so the horizontal stretch cannot thicken or distort it.
      Axis labels are HTML around the chart, never SVG text, for the same reason. */
@@ -1857,7 +1873,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .eqhead { display: flex; justify-content: space-between; align-items: baseline; gap: 12px;
             flex-wrap: wrap; font-size: 12px; color: var(--muted); margin-bottom: 8px; }
   .eqhead b { color: var(--text); font-weight: 600; }
-  .eq { display: block; width: 100%; height: 150px; overflow: visible; }
+  .eq { display: block; width: 100%; overflow: visible; }   /* height: HTML_EQUITY_HEIGHT, set inline */
   .eq path, .eq line { vector-effect: non-scaling-stroke; }
   .eqaxis { display: flex; justify-content: space-between; font-size: 11px;
             color: var(--muted); margin-top: 5px; }
@@ -1911,6 +1927,39 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .tradewrap tr[data-mx0] { cursor: crosshair; }
   .tradewrap tr.hot > td { background: color-mix(in srgb, var(--accent) 12%, transparent); }
 
+  /* ── Monthly returns ──────────────────────────────────────
+     A Jan–Dec row of diverging columns covering the trailing twelve months.
+     Plain HTML boxes positioned in px, so nothing is stretched and the labels
+     stay crisp. The zero line sits where the largest gain and largest loss
+     split the height. Months carried over from last year sit right of a
+     dashed divider, on a faint tint. */
+  .mowrap { border: 1px solid var(--border); border-radius: 9px; padding: 11px 13px 8px;
+            background: var(--panel); margin-bottom: 14px; }
+  .mogrid { display: grid; grid-template-columns: repeat(12, minmax(0, 1fr)); gap: 4px;
+            margin-top: 18px; }
+  .mocol { position: relative; display: flex; flex-direction: column; min-width: 0; }
+  .mocol.prev { background: color-mix(in srgb, var(--muted) 7%, transparent); border-radius: 4px; }
+  .mocol.split::before { content: ""; position: absolute; left: -2.5px; top: -4px; bottom: 0;
+                         border-left: 1px dashed var(--muted); opacity: .7; }
+  .mosplit { position: absolute; left: -2.5px; top: -18px; transform: translateX(-50%);
+             font-size: 10px; letter-spacing: .04em; color: var(--muted); white-space: nowrap; }
+  .moyy { opacity: .7; }
+  .moplot { position: relative; }   /* height: HTML_MONTHLY_HEIGHT, set inline */
+  .moplot::before { content: ""; position: absolute; left: -2px; right: -2px;
+                    top: var(--z); height: 1px; background: var(--border-2); }
+  .mobar { position: absolute; left: 12%; right: 12%; border-radius: 3px; }
+  .mobar.pos { bottom: calc(100% - var(--z)); border-radius: 3px 3px 1px 1px; }
+  .mobar.neg { top: var(--z); border-radius: 1px 1px 3px 3px; }
+  .moval { position: absolute; left: 0; right: 0; text-align: center; font-size: 10.5px;
+           font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap;
+           letter-spacing: -.01em; }
+  .momon { text-align: center; font-size: 10.5px; color: var(--muted); margin-top: 4px;
+           letter-spacing: .04em; }
+  .mocol.none .momon { opacity: .45; }
+  .monone { position: absolute; left: 0; right: 0; top: calc(var(--z) - 7px); text-align: center;
+            font-size: 10px; color: var(--muted); opacity: .45; }
+  @media (max-width: 720px) { .moval { font-size: 9px; } .moyy { display: none; } }
+
   .chips { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 14px; }
   .chip { border: 1px solid var(--border-2); border-radius: 999px; padding: 3px 11px; font-size: 12px; color: var(--muted); }
   .chip b { color: var(--text); font-weight: 600; }
@@ -1925,6 +1974,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .tradewrap { max-height: 340px; overflow: auto; border: 1px solid var(--border); border-radius: 9px; }
   .empty { padding: 40px; text-align: center; color: var(--muted); }
   footer { color: var(--muted); font-size: 12px; margin-top: 18px; }
+  footer a { color: inherit; text-decoration: underline; text-decoration-color: var(--border-2);
+             text-underline-offset: 2px; }
+  footer a:hover { color: var(--accent); text-decoration-color: currentColor; }
 
   @media (max-width: 720px) {
     .bar { width: 56px; }
@@ -1971,6 +2023,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <div class="field presetfield">
       <label for="preset">Quick range</label>
       <select id="preset" title="Periods end on the last day in the data">
+        <option value="all">All</option>
         <option value="">Custom</option>
         <option value="7d">Last 7 days</option>
         <option value="31d">Last 31 days</option>
@@ -1979,6 +2032,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <option value="month">This month</option>
         <option value="quarter">This quarter</option>
         <option value="year">This year</option>
+        <option value="lastyear">Last year</option>
+        <optgroup label="Month">
+          <option value="jan">January</option>
+          <option value="feb">February</option>
+          <option value="mar">March</option>
+          <option value="apr">April</option>
+          <option value="may">May</option>
+          <option value="jun">June</option>
+          <option value="jul">July</option>
+          <option value="aug">August</option>
+          <option value="sep">September</option>
+          <option value="oct">October</option>
+          <option value="nov">November</option>
+          <option value="dec">December</option>
+        </optgroup>
       </select>
     </div>
     <!-- Own full-width row: the count flows along the left, the slider stays
@@ -2663,7 +2731,9 @@ function equityChart(closed, win) {
   if (!win) return { html: "", marks: new Map(), xPct: () => null };
   const start = PAYLOAD.config.equityStart;
   const path  = equityPath(closed, win[0], win[1]);
-  const W = 800, H = 150, PY = 10;
+  // H matches the rendered pixel height (HTML_EQUITY_HEIGHT), so the viewBox is
+  // only ever stretched horizontally and PY stays a true 10px of headroom.
+  const W = 800, H = PAYLOAD.config.equityHeight, PY = 10;
   const t0 = path[0].ts, span = Math.max(1, path[path.length - 1].ts - t0);
 
   const bals = path.map(p => p.bal).concat([start]);
@@ -2720,7 +2790,7 @@ function equityChart(closed, win) {
             Final <b class="${plClass(ret)}">${final.toFixed(1)}</b> (${signed(ret)})</span>
     </div>
     <div class="eqplot">
-      <svg class="eq" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img"
+      <svg class="eq" style="height:${H}px" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img"
            aria-label="Account balance over time, ending at ${final.toFixed(1)}">
         ${monthLines}
         <path d="${area}" fill="${col}" fill-opacity=".12" stroke="none"></path>
@@ -2740,8 +2810,98 @@ function equityChart(closed, win) {
   return { html, marks, xPct };
 }
 
+/* ── Monthly returns ──────────────────────────────────────────────────────────
+   Deliberately blind to the page's date filter: built from the full TRADES
+   payload, never from r.trades, so the calendar stays the same whatever window
+   is selected. A trade counts in the month it closed — the moment it moved the
+   balance, matching where the equity curve takes its step — and a month's
+   trades compound together like everything else. Built once per strategy.
+
+   The axis is always Jan–Dec but shows the trailing twelve months: Jan up to
+   the current month come from this year, the months after it from last year,
+   with a divider where the two meet. "Current" is the latest exit anywhere in
+   the payload, so every strategy's calendar covers the same twelve months. */
+const MONTHLY = new Map();
+const LAST_EXIT = TRADES.reduce((a, t) => t.t1 && t.t1 > a ? t.t1 : a, "");
+const CUR_Y = +LAST_EXIT.slice(0, 4), CUR_M = +LAST_EXIT.slice(5, 7) - 1;
+
+function monthlyFor(name) {
+  if (!MONTHLY.has(name)) {
+    const byMonth = new Map();                       // "YYYY-MM" → [trades]
+    for (const t of TRADES) {
+      if (t.s !== name || !t.t1 || t.pnl === null || t.pnl === undefined) continue;
+      const key = t.t1.slice(0, 7);
+      if (!byMonth.has(key)) byMonth.set(key, []);
+      byMonth.get(key).push(t);
+    }
+    // Slot m holds that month's most recent occurrence up to the current month.
+    MONTHLY.set(name, MONTH_ABBR.map((_, m) => {
+      const y = m <= CUR_M ? CUR_Y : CUR_Y - 1;
+      const ts = byMonth.get(y + "-" + String(m + 1).padStart(2, "0"));
+      return { y, c: ts ? { r: compoundReturn(ts), n: ts.length } : null };
+    }));
+  }
+  return MONTHLY.get(name);
+}
+
+function monthlyChart(name) {
+  if (!LAST_EXIT) return "";
+  const slots = monthlyFor(name);
+  const cells = slots.map(s => s.c).filter(Boolean);
+  if (!cells.length) return "";
+  const maxPos = Math.max(0, ...cells.map(c => c.r));
+  const maxNeg = Math.max(0, ...cells.map(c => -c.r));
+  const range  = (maxPos + maxNeg) || 1;
+  const maxAbs = Math.max(maxPos, maxNeg) || 1;
+  // Pixel budget: labels sit just beyond each bar's tip, so PAD is kept free
+  // above and below the tallest bars for them.
+  const PLOT = PAYLOAD.config.monthlyHeight, PAD = 15, USE = PLOT - 2 * PAD;
+  const z = PAD + USE * maxPos / range;
+  const plotStyle = `height:${PLOT}px;--z:${z.toFixed(1)}px`;
+
+  const yy = y => " ’" + String(y).slice(2);
+  const col = (c, m, y) => {
+    // Last year's months are set apart: a divider before the first of them, a
+    // faint tint behind all of them, and the year beside each month name.
+    const prev = y < CUR_Y;
+    const cls  = (prev ? " prev" : "") + (m === CUR_M + 1 ? " split" : "");
+    const mon  = `<div class="momon">${MONTH_ABBR[m]}${prev ? `<span class="moyy">${yy(y)}</span>` : ""}</div>`;
+    const tag  = m === CUR_M + 1 ? `<span class="mosplit" title="Months right of this line are from ${y}">◂ ${CUR_Y} │ ${y} ▸</span>` : "";
+    if (!c) return `<div class="mocol none${cls}">${tag}<div class="moplot" style="${plotStyle}">
+        <span class="monone">·</span></div>${mon}</div>`;
+    const h = Math.max(c.r ? 2 : 0, Math.abs(c.r) / range * USE);
+    // Stronger results get a more saturated column; the floor keeps a small
+    // month clearly green or red rather than fading into the track.
+    const tone = (38 + 62 * Math.min(1, Math.abs(c.r) / maxAbs)).toFixed(0);
+    const up = c.r >= 0;
+    const colour = `color-mix(in srgb, var(--${up ? "green" : "red"}) ${tone}%, transparent)`;
+    const labelPos = up ? `bottom:calc(100% - ${z.toFixed(1)}px + ${(h + 2).toFixed(1)}px)`
+                        : `top:${(z + h + 2).toFixed(1)}px`;
+    const title = `${MONTH_ABBR[m]} ${y}: ${signed(c.r)} over ${c.n} closed trade${c.n === 1 ? "" : "s"}`;
+    return `<div class="mocol${cls}" title="${esc(title)}">${tag}
+        <div class="moplot" style="${plotStyle}">
+          <span class="mobar ${up ? "pos" : "neg"}" style="height:${h.toFixed(1)}px;background:${colour}"></span>
+          <span class="moval ${plClass(c.r)}" style="${labelPos}">${signed(c.r, 1)}</span>
+        </div>
+        ${mon}</div>`;
+  };
+
+  // Product of the monthly factors = compounded return over the twelve months.
+  const total = compoundReturn(cells.map(c => ({ pnl: c.r })));
+  const period = CUR_M === 11 ? `Jan–Dec ${CUR_Y}`
+               : `${MONTH_ABBR[CUR_M + 1]} ${CUR_Y - 1} – ${MONTH_ABBR[CUR_M]} ${CUR_Y}`;
+
+  return `<div class="mowrap">
+    <div class="eqhead">
+      <span>Monthly account P/L — last 12 months (${period}), compounded per month by exit date</span>
+      <span>12-month total <b class="${plClass(total)}">${signed(total)}</b> · ignores the date filter</span>
+    </div>
+    <div class="mogrid">${slots.map((s, m) => col(s.c, m, s.y)).join("")}</div>
+  </div>`;
+}
+
 function detailHtml(r, win) {
-  const chip = (label, v, cls) => `<span class="chip ${cls || ""}">${esc(label)} <b>${v}</b></span>`;
+  const chip =(label, v, cls) => `<span class="chip ${cls || ""}">${esc(label)} <b>${v}</b></span>`;
   const durRow = (label, ds) => `<tr>
       <td>${esc(label)}</td><td>${ds ? ds.n : 0}</td>
       <td>${ds ? esc(fmtDur(ds.min)) : "—"}</td>
@@ -2825,6 +2985,7 @@ function detailHtml(r, win) {
 
   return `<div class="detailbox">
     ${eq.html}
+    ${monthlyChart(r.name)}
     ${directionNote}
     <div class="chips">
       ${chip("TP1", r.tp1, "g")}${chip("Spike", r.spike, "g")}
@@ -3005,6 +3166,27 @@ function presetRange(key) {
   if (!DAY_MAX) return null;
   const end = new Date(DAY_MAX + "T00:00:00");
   const start = new Date(end);
+  // Kept local: DEFAULT_FROM calls this (hoisted) function before a top-level
+  // const declared here would be initialised.
+  const m = ["jan", "feb", "mar", "apr", "may", "jun",
+             "jul", "aug", "sep", "oct", "nov", "dec"].indexOf(key);
+  if (m >= 0) {
+    // The latest such month on or before DAY_MAX: a month still to come this
+    // year means last year's. The current month ends at DAY_MAX, not month end.
+    const y = end.getFullYear() - (m > end.getMonth() ? 1 : 0);
+    const from = dayOf(new Date(y, m, 1).getTime());
+    const last = dayOf(new Date(y, m + 1, 0).getTime());
+    if (last < DAY_MIN) return null;               // wholly before the data
+    return { from: from < DAY_MIN ? DAY_MIN : from, to: last > DAY_MAX ? DAY_MAX : last };
+  }
+  if (key === "all") return { from: DAY_MIN, to: DAY_MAX };
+  if (key === "lastyear") {
+    // The whole previous calendar year, clamped to the data like a month is.
+    const y = end.getFullYear() - 1;
+    const from = y + "-01-01", last = y + "-12-31";
+    if (last < DAY_MIN) return null;               // wholly before the data
+    return { from: from < DAY_MIN ? DAY_MIN : from, to: last > DAY_MAX ? DAY_MAX : last };
+  }
   switch (key) {
     case "7d":      start.setDate(start.getDate() - 6); break;    // 7 days incl. the last
     case "31d":     start.setDate(start.getDate() - 30); break;
@@ -3151,8 +3333,11 @@ $("foot-note").innerHTML =
   "Avg/trade is the geometric mean — the constant per-trade return that compounds to the same total. " +
   "Avg/month is the same per month, over the selected date range (minimum one month) shared by every strategy. " +
   "All figures recompute against the current filters.<br>" +
-  esc("Generated " + PAYLOAD.generated + " · " + PAYLOAD.meta.files.length +
-      " log file(s): " + PAYLOAD.meta.files.join(", "));
+  esc("Generated " + PAYLOAD.generated + " by ") +
+  (PAYLOAD.config.sourceUrl
+    ? `<a href="${esc(PAYLOAD.config.sourceUrl)}" target="_blank" rel="noopener">parse_logs_strats.py</a>`
+    : "parse_logs_strats.py") +
+  esc(" · " + PAYLOAD.meta.files.length + " log file(s): " + PAYLOAD.meta.files.join(", "));
 
 applyDefaults();
 loadState();      // silently a no-op when nothing was stored or storage is blocked
@@ -3260,6 +3445,9 @@ def write_html_report(all_stats: dict[str, StrategyStats], out_path: str, files:
             "sortDir":     -1 if HTML_DEFAULT_SORT_DESC else 1,
             "expandTop":   bool(HTML_EXPAND_TOP_ROW),
             "equityStart": HTML_EQUITY_START,
+            "sourceUrl":   HTML_SOURCE_LINK,
+            "equityHeight":  max(60, int(HTML_EQUITY_HEIGHT)),
+            "monthlyHeight": max(60, int(HTML_MONTHLY_HEIGHT)),
             "logScale":    bool(HTML_LOG_SCALE_DURATION),
             "tradingDays": TRADING_DAYS_PER_YEAR,
             "defaultFrom": default_from,      # "" = earliest day in the data
@@ -3291,6 +3479,10 @@ def write_html_report(all_stats: dict[str, StrategyStats], out_path: str, files:
                  + img(HTML_LOGO_FOR_DARK_THEME, "logo-dark"))
     else:
         brand = "ProfitView"
+    # A new tab, so following the logo never navigates away from the report.
+    if HTML_LOGO_LINK:
+        brand = (f'<a class="brandlink" href="{escape(HTML_LOGO_LINK, quote=True)}" '
+                 f'target="_blank" rel="noopener" title="Open ProfitView">{brand}</a>')
 
     html = (HTML_TEMPLATE
             .replace("/*__DATA__*/ null", blob)
