@@ -2803,8 +2803,29 @@ function detailHtml(r, win) {
     `<span class="chip">Best <b class="pos">${signed(r.best)}</b></span>` +
     `<span class="chip">Worst <b class="neg">${signed(r.worst)}</b></span>`;
 
+  // Long/short split over the same (window-filtered) trades as the table below.
+  // Win rate per side counts only closed trades with a known outcome, like the
+  // main win-rate column. Trades with an unknown side are left out of both.
+  const side = d => {
+    const all = r.trades.filter(t => t.d === d);
+    const decided = all.filter(t => t.w === true || t.w === false);
+    const wins = decided.filter(t => t.w === true).length;
+    return { n: all.length, wr: decided.length ? wins / decided.length : null };
+  };
+  const lng = side(1), sht = side(-1);
+  const sideChip = (label, s) =>
+    chip(label, s.n + (s.wr === null ? "" : ` <span class="dim">· ${pct(s.wr)} win</span>`));
+  const lsRatio = sht.n ? (lng.n / sht.n).toFixed(2)
+                : lng.n ? "all long" : "—";
+  const lsShare = lng.n + sht.n ? pct(lng.n / (lng.n + sht.n)) + " long" : null;
+  const directionNote = lng.n + sht.n === 0 ? "" : `<div class="chips">
+      ${sideChip("▲ Long", lng)}${sideChip("▼ Short", sht)}
+      ${chip("L/S ratio", lsRatio)}${lsShare ? chip("Mix", lsShare) : ""}
+    </div>`;
+
   return `<div class="detailbox">
     ${eq.html}
+    ${directionNote}
     <div class="chips">
       ${chip("TP1", r.tp1, "g")}${chip("Spike", r.spike, "g")}
       ${chip("SL", r.sl, "r")}${chip("Timeout", r.timeout, "r")}${chip("Flip", r.flip, "r")}
