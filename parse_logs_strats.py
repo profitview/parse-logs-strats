@@ -184,6 +184,10 @@ HTML_EQUITY_HEIGHT    = 150      # px, plot height of the account balance chart
 HTML_MONTHLY_HEIGHT   = 118      # px, plot height of the monthly P/L columns (month
                                  # names below it are extra); 15px of it is kept free
                                  # top and bottom for the % labels. Both minimum 60.
+HTML_FUNNEL_HEIGHT    = 36       # px, gap between the two charts that the funnel
+                                 # (curve's date range → its months) curves through;
+                                 # 0 turns the funnel off. Below 14 it no longer
+                                 # widens the normal gap, so the curves flatten out.
 HTML_LOG_SCALE_DURATION = True   # start with log-scaled duration bars (trade times
                                  # span seconds to weeks, which a linear bar squashes)
 
@@ -1944,6 +1948,23 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .mosplit { position: absolute; left: -2.5px; top: -18px; transform: translateX(-50%);
              font-size: 10px; letter-spacing: .04em; color: var(--muted); white-space: nowrap; }
   .moyy { opacity: .7; }
+  /* Hover marker, mirrored from the curve: a faint tint over the months the
+     trade was open in, a stronger one with an outline on the month it closed
+     in — the column its P/L is counted in. Declared after .prev so it wins. */
+  /* Funnel from the curve's axis to the months it covers (drawFunnels). The
+     wider gap gives the S-curves room to bend: margin-top is HTML_FUNNEL_HEIGHT,
+     set inline, and collapses with .eqwrap's margin-bottom rather than adding
+     to it. The overlay never takes the pointer, so the columns underneath stay
+     hoverable and clickable. */
+  .detailbox { position: relative; }
+  .funnelsvg { position: absolute; left: 0; top: 0; overflow: visible; pointer-events: none; }
+  .funnelsvg .fnfill { fill: color-mix(in srgb, var(--accent) 7%, transparent); }
+  .funnelsvg .fnedge { fill: none; stroke: var(--accent); stroke-opacity: .55; stroke-width: 1.25; }
+  .mocol.pick { cursor: pointer; }
+  .mocol.pick:hover { background: color-mix(in srgb, var(--accent) 9%, transparent); border-radius: 4px; }
+  .mocol.live { background: color-mix(in srgb, var(--accent) 9%, transparent); border-radius: 4px; }
+  .mocol.hot  { background: color-mix(in srgb, var(--accent) 20%, transparent); border-radius: 4px;
+                box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 60%, transparent); }
   .moplot { position: relative; }   /* height: HTML_MONTHLY_HEIGHT, set inline */
   .moplot::before { content: ""; position: absolute; left: -2px; right: -2px;
                     top: var(--z); height: 1px; background: var(--border-2); }
@@ -2307,6 +2328,11 @@ let sortDir = PAYLOAD.config.sortDir;
 const DEFAULT_SORT_KEY = sortKey, DEFAULT_SORT_DIR = sortDir;
 const expanded = new Set();
 let lastRowNames = [];
+/* sortKey === null means "unsorted": the rows keep frozenOrder, the order they
+   were in when sorting was dropped. Only a click on a month column does that,
+   so re-filtering from inside a detail panel does not reshuffle the table
+   under the pointer; a click on any header sorts again. */
+let frozenOrder = [];
 
 const $ = id => document.getElementById(id);
 
@@ -2346,12 +2372,20 @@ function render() {
   // KPI tiles to the footer totals, is computed over the rows that survive here.
   rows = rows.filter(r => r.closed > 0);
 
-  const col = COLS.find(c => c.key === sortKey) || COLS[0];
-  rows.sort((a, b) => {
-    const x = col.sort(a), y = col.sort(b);
-    const c = x < y ? -1 : x > y ? 1 : 0;
-    return c * sortDir || a.name.localeCompare(b.name);
-  });
+  if (sortKey === null) {
+    // Strategies that were not listed when the order froze go last, by name
+    // (Infinity - Infinity is NaN, which falls through to the name compare).
+    const at = new Map(frozenOrder.map((n, i) => [n, i]));
+    const pos = r => at.has(r.name) ? at.get(r.name) : Infinity;
+    rows.sort((a, b) => pos(a) - pos(b) || a.name.localeCompare(b.name));
+  } else {
+    const col = COLS.find(c => c.key === sortKey) || COLS[0];
+    rows.sort((a, b) => {
+      const x = col.sort(a), y = col.sort(b);
+      const c = x < y ? -1 : x > y ? 1 : 0;
+      return c * sortDir || a.name.localeCompare(b.name);
+    });
+  }
 
   lastRowNames = rows.map(r => r.name);
 
@@ -2501,6 +2535,7 @@ function renderBody(rows, win) {
     };
   });
   bindTradeMarkers($("body"));
+  drawFunnels($("body"));
 }
 
 /* ── Trade ⇄ curve marker ─────────────────────────────────────────────────────
@@ -2517,6 +2552,23 @@ function bindTradeMarkers(root) {
     box.querySelectorAll("tr[data-mx0]").forEach(tr => {
       tr.onmouseenter = () => showMark(box, tr);
       tr.onmouseleave = () => clearMark(box);
+    });
+    // Month columns join in: hovering one marks the first trade counted in that
+    // month (if the filter lets it into the table), clicking one filters to it.
+    box.querySelectorAll(".mogrid > .mocol").forEach((col, m) => {
+      const k = (m - CUR_M + 11) % 12;         // inverse of markMonths()' column mapping
+      col.onmouseenter = () => {
+        const tr = firstInMonth(box, k);
+        if (tr) { showMark(box, tr); revealRow(box, tr); } else clearMark(box);
+      };
+      col.onmouseleave = () => clearMark(box);
+      if (col.dataset.from) col.onclick = () => {
+        frozenOrder = lastRowNames.slice();
+        sortKey = null;                        // see frozenOrder
+        $("from").value = col.dataset.from;
+        $("to").value   = col.dataset.to;
+        render();
+      };
     });
     const plot = box.querySelector(".eqplot");
     if (!plot) return;
@@ -2555,6 +2607,14 @@ function rowAtX(box, x) {
   return best;
 }
 
+/* The earliest listed trade that closed in trailing month k — the same trades
+   the column's figure is built from. Rows are newest-first, so it is the last
+   match. Null when the date filter keeps all of them out of the table. */
+function firstInMonth(box, k) {
+  const rows = box.querySelectorAll(`tr[data-mkx="${k}"]`);
+  return rows.length ? rows[rows.length - 1] : null;
+}
+
 function showMark(box, tr) {
   const mark = box.querySelector(".eqmark");
   if (!mark || box.__hot === tr) return;      // mousemove repeats within one trade
@@ -2572,6 +2632,7 @@ function showMark(box, tr) {
     dot.className  = "eqdot " + (d.mc || "");
   }
   placeTip(mark, tr, d);
+  markMonths(box, d);
   mark.hidden = false;
   tr.classList.add("hot");
   box.__hot = tr;
@@ -2612,6 +2673,7 @@ function placeTip(mark, tr, d) {
 function clearMark(box) {
   const mark = box.querySelector(".eqmark");
   if (mark) mark.hidden = true;
+  markMonths(box, null);
   if (box.__hot) box.__hot.classList.remove("hot");
   box.__hot = null;
 }
@@ -2844,7 +2906,80 @@ function monthlyFor(name) {
   return MONTHLY.get(name);
 }
 
-function monthlyChart(name) {
+/* ── Funnel from the curve to the calendar ────────────────────────────────────
+   When the filter window is under a year, a funnel joins the equity curve's
+   x-axis to the stretch of the monthly chart it covers. Returned as segments
+   [eqX0, eqX1, col0, col1]: eqX in % of the curve's plot, col as a fractional
+   Jan–Dec column position (3.5 = halfway through April). Because the calendar
+   shows the trailing twelve months, a window across New Year lands at both
+   ends of the grid, so it is cut at Jan 1 into two segments. Null when there
+   is nothing to point at, or the window covers the whole twelve anyway. */
+function funnelSegs(win) {
+  if (!win || !LAST_EXIT || !PAYLOAD.config.funnelHeight || win[1] - win[0] > 366 * 864e5) return null;
+  const lo = new Date(CUR_Y - 1, CUR_M + 1, 1).getTime();   // first day of the twelve
+  const hi = new Date(CUR_Y, CUR_M + 1, 1).getTime();       // day after the last
+  const a = Math.max(win[0], lo), b = Math.min(win[1], hi);
+  if (a >= b || (a === lo && b === hi)) return null;
+  const jan = new Date(CUR_Y, 0, 1).getTime();
+  const cuts = jan > a && jan < b ? [a, jan, b] : [a, b];
+  const ex  = ts => +((ts - win[0]) / (win[1] - win[0]) * 100).toFixed(3);
+  const col = ts => {
+    const d = new Date(ts);
+    const s = new Date(d.getFullYear(), d.getMonth(), 1), e = new Date(d.getFullYear(), d.getMonth() + 1, 1);
+    return +(d.getMonth() + (ts - s) / (e - s)).toFixed(4);
+  };
+  // A segment's end is read 1 ms early, so one ending at a 1st lands on the
+  // right edge of the month before instead of the left edge of the next.
+  return cuts.slice(1).map((b, i) => [ex(cuts[i]), ex(b), col(cuts[i]), col(b - 1)]);
+}
+
+/* Drawn after layout, from measured boxes: the curve's plot and the month
+   columns sit at different insets in different boxes, so no shared coordinate
+   system exists to draw it in up front. Redrawn on every render and resize. */
+function drawFunnels(root) {
+  const f = n => n.toFixed(1);
+  root.querySelectorAll(".detailbox").forEach(box => {
+    box.querySelector(".funnelsvg")?.remove();
+    const mo = box.querySelector(".mowrap[data-fun]");
+    const eqw = box.querySelector(".eqwrap"), plot = box.querySelector(".eqplot");
+    if (!mo || !eqw || !plot) return;
+    const cols = mo.querySelectorAll(".mogrid > .mocol");
+    const B = box.getBoundingClientRect();
+    if (!B.width || cols.length !== 12) return;
+    const P = plot.getBoundingClientRect(), C = cols[0].getBoundingClientRect();
+    const yTop = eqw.getBoundingClientRect().bottom - B.top;
+    const yMid = mo.getBoundingClientRect().top - B.top;
+    const yBot = C.bottom - B.top, bend = (yMid - yTop) * 0.55;
+    const px = e => P.left - B.left + e / 100 * P.width;
+    const gx = p => {
+      const i = Math.min(11, Math.floor(p)), r = cols[i].getBoundingClientRect();
+      return r.left - B.left + (p - i) * r.width;
+    };
+    // Each side: an S-curve down the gap, then straight down through the columns.
+    const down = (x, g) => `C ${f(x)} ${f(yTop + bend)} ${f(g)} ${f(yMid - bend)} ${f(g)} ${f(yMid)} V ${f(yBot)}`;
+    const up   = (g, x) => `V ${f(yMid)} C ${f(g)} ${f(yMid - bend)} ${f(x)} ${f(yTop + bend)} ${f(x)} ${f(yTop)}`;
+    let out = "";
+    for (const [e0, e1, p0, p1] of JSON.parse(mo.dataset.fun)) {
+      const a = px(e0), b = px(e1), c = gx(p0), d = gx(p1);
+      out += `<path class="fnfill" d="M ${f(a)} ${f(yTop)} ${down(a, c)} H ${f(d)} ${up(d, b)} Z"></path>` +
+             `<path class="fnedge" d="M ${f(a)} ${f(yTop)} ${down(a, c)}"></path>` +
+             `<path class="fnedge" d="M ${f(b)} ${f(yTop)} ${down(b, d)}"></path>`;
+    }
+    box.insertAdjacentHTML("beforeend",
+      `<svg class="funnelsvg" width="${f(B.width)}" height="${f(yBot)}" aria-hidden="true">${out}</svg>`);
+  });
+}
+
+let funnelQueued = false;
+function redrawFunnels() {
+  if (funnelQueued) return;
+  funnelQueued = true;
+  requestAnimationFrame(() => { funnelQueued = false; drawFunnels($("body")); });
+}
+window.addEventListener("resize", redrawFunnels);
+document.fonts?.ready.then(redrawFunnels);   // a late web font shifts the boxes
+
+function monthlyChart(name, win) {
   if (!LAST_EXIT) return "";
   const slots = monthlyFor(name);
   const cells = slots.map(s => s.c).filter(Boolean);
@@ -2864,11 +2999,16 @@ function monthlyChart(name) {
     // Last year's months are set apart: a divider before the first of them, a
     // faint tint behind all of them, and the year beside each month name.
     const prev = y < CUR_Y;
-    const cls  = (prev ? " prev" : "") + (m === CUR_M + 1 ? " split" : "");
+    // A click filters the page to this month; a month wholly outside the data
+    // has nothing to filter to and stays inert.
+    const pick = monthRange(y, m);
+    const cls  = (prev ? " prev" : "") + (m === CUR_M + 1 ? " split" : "") + (pick ? " pick" : "");
+    const hint = pick ? `\nClick to filter to ${MONTH_ABBR[m]} ${y}` : "";
+    const data = pick ? ` data-from="${pick.from}" data-to="${pick.to}"` : "";
     const mon  = `<div class="momon">${MONTH_ABBR[m]}${prev ? `<span class="moyy">${yy(y)}</span>` : ""}</div>`;
     const tag  = m === CUR_M + 1 ? `<span class="mosplit" title="Months right of this line are from ${y}">◂ ${CUR_Y} │ ${y} ▸</span>` : "";
-    if (!c) return `<div class="mocol none${cls}">${tag}<div class="moplot" style="${plotStyle}">
-        <span class="monone">·</span></div>${mon}</div>`;
+    if (!c) return `<div class="mocol none${cls}"${data}${pick ? ` title="${esc(`${MONTH_ABBR[m]} ${y}: no closed trades` + hint)}"` : ""}>${tag}
+        <div class="moplot" style="${plotStyle}"><span class="monone">·</span></div>${mon}</div>`;
     const h = Math.max(c.r ? 2 : 0, Math.abs(c.r) / range * USE);
     // Stronger results get a more saturated column; the floor keeps a small
     // month clearly green or red rather than fading into the track.
@@ -2877,8 +3017,8 @@ function monthlyChart(name) {
     const colour = `color-mix(in srgb, var(--${up ? "green" : "red"}) ${tone}%, transparent)`;
     const labelPos = up ? `bottom:calc(100% - ${z.toFixed(1)}px + ${(h + 2).toFixed(1)}px)`
                         : `top:${(z + h + 2).toFixed(1)}px`;
-    const title = `${MONTH_ABBR[m]} ${y}: ${signed(c.r)} over ${c.n} closed trade${c.n === 1 ? "" : "s"}`;
-    return `<div class="mocol${cls}" title="${esc(title)}">${tag}
+    const title = `${MONTH_ABBR[m]} ${y}: ${signed(c.r)} over ${c.n} closed trade${c.n === 1 ? "" : "s"}` + hint;
+    return `<div class="mocol${cls}"${data} title="${esc(title)}">${tag}
         <div class="moplot" style="${plotStyle}">
           <span class="mobar ${up ? "pos" : "neg"}" style="height:${h.toFixed(1)}px;background:${colour}"></span>
           <span class="moval ${plClass(c.r)}" style="${labelPos}">${signed(c.r, 1)}</span>
@@ -2891,13 +3031,45 @@ function monthlyChart(name) {
   const period = CUR_M === 11 ? `Jan–Dec ${CUR_Y}`
                : `${MONTH_ABBR[CUR_M + 1]} ${CUR_Y - 1} – ${MONTH_ABBR[CUR_M]} ${CUR_Y}`;
 
-  return `<div class="mowrap">
+  const fun = funnelSegs(win);
+  return `<div class="mowrap${fun ? " funnel" : ""}"${fun ? ` style="margin-top:${PAYLOAD.config.funnelHeight}px" data-fun='${JSON.stringify(fun)}'` : ""}>
     <div class="eqhead">
       <span>Monthly account P/L — last 12 months (${period}), compounded per month by exit date</span>
       <span>12-month total <b class="${plClass(total)}">${signed(total)}</b> · ignores the date filter</span>
     </div>
     <div class="mogrid">${slots.map((s, m) => col(s.c, m, s.y)).join("")}</div>
   </div>`;
+}
+
+/* Month geometry for the hover marker. A month is addressed by its position in
+   the trailing twelve (k = 0 oldest … 11 current) rather than by its Jan–Dec
+   column, so a trade from two years ago cannot light up this year's column of
+   the same name. The column for k is (CUR_M + 1 + k) % 12.
+     mk0..mk1  months the trade was open in, clamped to the twelve — an open
+               trade runs to the current month
+     mkx       the month it closed in, i.e. the column it is counted in; only
+               for trades with a P/L, the same ones monthlyFor() counts */
+function moIdx(s) {
+  return (+s.slice(0, 4)) * 12 + (+s.slice(5, 7) - 1) - (CUR_Y * 12 + CUR_M - 11);
+}
+
+function monthAttrs(t) {
+  if (!LAST_EXIT || !t.t0) return "";
+  const k0 = moIdx(t.t0), kx = t.t1 ? moIdx(t.t1) : null;
+  const k1 = kx === null ? 11 : kx;
+  if (k1 < 0 || k0 > 11) return "";
+  const counted = kx !== null && kx >= 0 && kx <= 11 && t.pnl !== null && t.pnl !== undefined;
+  return ` data-mk0="${Math.max(0, k0)}" data-mk1="${Math.min(11, k1)}"` +
+         (counted ? ` data-mkx="${kx}"` : "");
+}
+
+function markMonths(box, d) {
+  const cols = box.querySelectorAll(".mogrid > .mocol");
+  cols.forEach(c => c.classList.remove("live", "hot"));
+  if (!d || d.mk0 === undefined) return;
+  const col = k => cols[(CUR_M + 1 + k) % 12];
+  for (let k = +d.mk0; k <= +d.mk1; k++) col(k)?.classList.add("live");
+  if (d.mkx !== undefined) col(+d.mkx)?.classList.add("hot");
 }
 
 function detailHtml(r, win) {
@@ -2929,7 +3101,8 @@ function detailHtml(r, win) {
     const x1 = ex === null ? 100 : Math.max(ex, x0);
     return ` data-mx0="${x0.toFixed(2)}" data-mx1="${x1.toFixed(2)}"` +
            ` data-mvl="${(ex === null ? x0 : ex).toFixed(2)}"` +
-           (m ? ` data-my="${m.y.toFixed(2)}" data-mc="${t.w === true ? "pos" : t.w === false ? "neg" : ""}"` : "");
+           (m ? ` data-my="${m.y.toFixed(2)}" data-mc="${t.w === true ? "pos" : t.w === false ? "neg" : ""}"` : "") +
+           monthAttrs(t);
   };
 
   const tradeRows = trades.map(({ t, n }) => {
@@ -2985,7 +3158,7 @@ function detailHtml(r, win) {
 
   return `<div class="detailbox">
     ${eq.html}
-    ${monthlyChart(r.name)}
+    ${monthlyChart(r.name, win)}
     ${directionNote}
     <div class="chips">
       ${chip("TP1", r.tp1, "g")}${chip("Spike", r.spike, "g")}
@@ -3173,11 +3346,7 @@ function presetRange(key) {
   if (m >= 0) {
     // The latest such month on or before DAY_MAX: a month still to come this
     // year means last year's. The current month ends at DAY_MAX, not month end.
-    const y = end.getFullYear() - (m > end.getMonth() ? 1 : 0);
-    const from = dayOf(new Date(y, m, 1).getTime());
-    const last = dayOf(new Date(y, m + 1, 0).getTime());
-    if (last < DAY_MIN) return null;               // wholly before the data
-    return { from: from < DAY_MIN ? DAY_MIN : from, to: last > DAY_MAX ? DAY_MAX : last };
+    return monthRange(end.getFullYear() - (m > end.getMonth() ? 1 : 0), m);
   }
   if (key === "all") return { from: DAY_MIN, to: DAY_MAX };
   if (key === "lastyear") {
@@ -3200,6 +3369,17 @@ function presetRange(key) {
   // Clamped so the date box never holds a day outside its own min.
   const from = dayOf(start.getTime());
   return { from: from < DAY_MIN ? DAY_MIN : from, to: DAY_MAX };
+}
+
+/* One calendar month (m is 0-based) clamped to the data, or null when it lies
+   wholly outside it. Shared by the month presets and the monthly chart's
+   clickable columns, so a click lands on exactly the range the dropdown would
+   pick — and the dropdown then shows that month selected. */
+function monthRange(y, m) {
+  const from = dayOf(new Date(y, m, 1).getTime());
+  const last = dayOf(new Date(y, m + 1, 0).getTime());
+  if (last < DAY_MIN || from > DAY_MAX) return null;
+  return { from: from < DAY_MIN ? DAY_MIN : from, to: last > DAY_MAX ? DAY_MAX : last };
 }
 
 function syncPresetFromDates() {
@@ -3448,6 +3628,7 @@ def write_html_report(all_stats: dict[str, StrategyStats], out_path: str, files:
             "sourceUrl":   HTML_SOURCE_LINK,
             "equityHeight":  max(60, int(HTML_EQUITY_HEIGHT)),
             "monthlyHeight": max(60, int(HTML_MONTHLY_HEIGHT)),
+            "funnelHeight":  max(0, int(HTML_FUNNEL_HEIGHT)),
             "logScale":    bool(HTML_LOG_SCALE_DURATION),
             "tradingDays": TRADING_DAYS_PER_YEAR,
             "defaultFrom": default_from,      # "" = earliest day in the data
