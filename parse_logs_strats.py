@@ -1993,6 +1993,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   table.mini th, table.mini td { padding: 5px 10px; border-bottom: 1px solid var(--border); }
   table.mini thead th { position: static; background: transparent; cursor: default; }
   .tradewrap { max-height: 340px; overflow: auto; border: 1px solid var(--border); border-radius: 9px; }
+  /* Pin the trade list's header inside its own scroll box. It needs an opaque
+     background so rows don't show through, and the rule under it is drawn as
+     an inset shadow: with border-collapse a sticky cell's border stays behind
+     on the scrolled row instead of travelling with the header. */
+  .tradewrap table.mini thead th { position: sticky; top: 0; z-index: 1;
+                                   background: var(--panel-2);
+                                   box-shadow: inset 0 -1px 0 var(--border); }
   .empty { padding: 40px; text-align: center; color: var(--muted); }
   footer { color: var(--muted); font-size: 12px; margin-top: 18px; }
   footer a { color: inherit; text-decoration: underline; text-decoration-color: var(--border-2);
@@ -2685,7 +2692,11 @@ function revealRow(box, tr) {
   const wrap = box.querySelector(".tradewrap");
   if (!wrap) return;
   const w = wrap.getBoundingClientRect(), r = tr.getBoundingClientRect();
-  if (r.top < w.top)         wrap.scrollTop += r.top - w.top - 4;
+  // The sticky header covers the top of the box, so rows count as hidden
+  // until they clear it.
+  const head = wrap.querySelector("thead");
+  const top  = w.top + (head ? head.offsetHeight : 0);
+  if (r.top < top)           wrap.scrollTop += r.top - top - 4;
   else if (r.bottom > w.bottom) wrap.scrollTop += r.bottom - w.bottom + 4;
 }
 
