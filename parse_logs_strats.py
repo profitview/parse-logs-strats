@@ -1194,22 +1194,34 @@ def build_trades(events: list[tuple], allow_flips: bool = ALLOW_FLIPS,
 
 def fmt_duration(seconds: Optional[float]) -> str:
     """
-    Compact H:MM. Seconds are dropped, so anything under a minute reads '0:00';
-    fmt_duration_full() keeps the precision where there is room for it.
+    Compact '42s' / '59m' / '2.1h' / '1.1d'. Hours and days are rounded *up* to
+    one decimal, with a trailing '.0' dropped ('2h'); above a minute, seconds
+    are ignored. fmt_duration_full() keeps the precision where there is room
+    for it.
     """
     if seconds is None:
         return "—"
-    total_minutes = int(seconds // 60)
-    return f"{total_minutes // 60}:{total_minutes % 60:02d}"
+    mins = int(seconds // 60)
+    if mins == 0:
+        return f"{int(seconds)}s"
+    if mins < 60:
+        return f"{mins}m"
+    # Ceil in integer tenths (6 min = 0.1h, 144 min = 0.1d) to dodge float error.
+    per, unit = (144, "d") if mins >= 1440 else (6, "h")
+    t = -(-mins // per)
+    return f"{t // 10}{unit}" if t % 10 == 0 else f"{t // 10}.{t % 10}{unit}"
 
 
 def fmt_duration_full(seconds: Optional[float]) -> str:
     """Long form with seconds — used for HTML tooltips."""
     if seconds is None:
         return "—"
-    h = int(seconds // 3600)
+    d = int(seconds // 86400)
+    h = int((seconds % 86400) // 3600)
     m = int((seconds % 3600) // 60)
     s = seconds % 60
+    if d:
+        return f"{d}d {h:02d}h {m:02d}m {s:04.1f}s"
     if h:
         return f"{h}h {m:02d}m {s:04.1f}s"
     if m:
@@ -1947,17 +1959,26 @@ function marketTag(name) {
 }
 
 /* ── Formatting helpers (mirrors fmt_duration / fmt_price in the Python side) ── */
-/* Compact H:MM — seconds dropped, so sub-minute trades read "0:00".
+/* Compact "42s" / "59m" / "2.1h" / "1.1d" — hours and days rounded *up* to one
+   decimal with a trailing ".0" dropped ("2h"); above a minute, seconds are ignored.
    fmtDurFull() keeps the precision and is used for hover tooltips. */
 function fmtDur(s) {
   if (s === null || s === undefined) return "—";
   const mins = Math.floor(s / 60);
-  return Math.floor(mins / 60) + ":" + String(mins % 60).padStart(2, "0");
+  if (mins === 0) return Math.floor(s) + "s";
+  if (mins < 60) return mins + "m";
+  /* Ceil in integer tenths (6 min = 0.1h, 144 min = 0.1d) to dodge float error. */
+  const [per, unit] = mins >= 1440 ? [144, "d"] : [6, "h"];
+  const t = Math.ceil(mins / per), whole = Math.floor(t / 10);
+  return (t % 10 ? whole + "." + (t % 10) : whole) + unit;
 }
 function fmtDurFull(s) {
   if (s === null || s === undefined) return "—";
-  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
-  if (h) return h + "h " + String(m).padStart(2, "0") + "m " + sec.toFixed(1).padStart(4, "0") + "s";
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600),
+        m = Math.floor((s % 3600) / 60), sec = s % 60;
+  const tail = String(m).padStart(2, "0") + "m " + sec.toFixed(1).padStart(4, "0") + "s";
+  if (d) return d + "d " + String(h).padStart(2, "0") + "h " + tail;
+  if (h) return h + "h " + tail;
   if (m) return m + "m " + sec.toFixed(1).padStart(4, "0") + "s";
   return sec.toFixed(1) + "s";
 }
