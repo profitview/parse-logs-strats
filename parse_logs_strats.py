@@ -19,7 +19,7 @@ import fnmatch
 import argparse
 import subprocess
 import contextlib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass, field
 from html import escape
 from typing import Optional
@@ -221,6 +221,28 @@ HTML_LOGO_HEIGHT_PX       = 34   # rendered height; width follows the 1010x193 r
 HTML_LOGO_LINK            = "https://profitview.app"   # the logo links here ("" = no link)
 # Linked from "by parse_logs_strats.py" in the page footer ("" = plain text).
 HTML_SOURCE_LINK          = "https://github.com/profitview/parse-logs-strats"
+
+# Trade chart preview: hovering a trade in a strategy's detail table shows the
+# market's candles around it, with entry, exit, take-profit and stop-loss marked
+# (a click pins the chart). Candles come live from Bybit's public kline API, the
+# same prices the bot traded on, and the chart library is loaded from the CDN on
+# first use — so this needs a network connection; the rest of the report does not.
+# This sets whether the report's "Trade charts" box starts ticked; the viewer can
+# still switch it, and the choice is remembered like the filters.
+HTML_TRADE_CHART   = True
+# How long the pointer has to rest on a trade row before its chart opens, in
+# milliseconds. Lower feels snappier; higher keeps charts from popping up while
+# you move across the table (only rows rested on this long fetch any candles).
+HTML_CHART_HOVER_MS = 500
+HTML_CHART_LIB_URL = ("https://cdn.jsdelivr.net/npm/lightweight-charts@4.2.3/"
+                      "dist/lightweight-charts.standalone.production.js")
+
+# Log timestamps carry no timezone. The chart needs real (UTC) instants to ask
+# the exchange for the right candles. None reads them as the local time of the
+# machine generating the report, daylight saving included — right when that is
+# where the logs were written. A number forces a fixed offset from UTC in hours
+# (e.g. 2 for CEST), which ignores daylight saving.
+LOG_UTC_OFFSET_HOURS = None
 
 # ══ END CONFIGURATION ═════════════════════════════════════════════════════════
 
@@ -1930,6 +1952,31 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .tipg > b { font-weight: 600; font-variant-numeric: tabular-nums; }
   .tradewrap tr[data-mx0] { cursor: crosshair; }
   .tradewrap tr.hot > td { background: color-mix(in srgb, var(--accent) 12%, transparent); }
+  .tradewrap tr.pinned > td { background: color-mix(in srgb, var(--accent) 20%, transparent); }
+
+  /* Trade chart popover. Fixed rather than inside the scrolling trade table so
+     it is never clipped by it. While it only follows the hover it ignores the
+     pointer, so it can never cover the row it belongs to and flicker; pinned,
+     it takes the pointer so the chart can be panned and zoomed. */
+  .tchart { position: fixed; z-index: 50; width: min(580px, calc(100vw - 32px));
+            background: var(--panel); border: 1px solid var(--border-2);
+            border-radius: 10px; box-shadow: var(--shadow); padding: 8px 10px 10px;
+            pointer-events: none; font-size: 11.5px; color: var(--text); }
+  .tchart.pinned { pointer-events: auto; border-color: var(--accent); }
+  .tchead { display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px; }
+  .tchead b { font-weight: 600; }
+  .tchead .dim { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .tcclose { border: 0; background: none; color: var(--muted); cursor: pointer;
+             font-size: 14px; line-height: 1; padding: 2px 4px; border-radius: 4px; }
+  .tcclose:hover { background: var(--border); color: var(--text); }
+  .tchart:not(.pinned) .tcclose { visibility: hidden; }
+  .tcplot { position: relative; height: 260px; }
+  .tcmsg { position: absolute; inset: 0; display: flex; align-items: center;
+           justify-content: center; text-align: center; color: var(--muted); padding: 0 20px; }
+  .tcmsg:empty { display: none; }             /* else it would sit over the chart */
+  .tclegend { display: flex; flex-wrap: wrap; gap: 4px 14px; margin-top: 6px; color: var(--muted); }
+  .tclegend i { display: inline-block; width: 14px; border-top: 2px solid; vertical-align: middle; margin-right: 5px; }
+  .tclegend i.dash { border-top-style: dashed; }
 
   /* ── Monthly returns ──────────────────────────────────────
      A Jan–Dec row of diverging columns covering the trailing twelve months.
@@ -2044,7 +2091,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <label for="to">Until</label>
       <input type="date" id="to">
     </div>
-    <label class="check"><input type="checkbox" id="logscale"> Log-scale duration bars</label>
+    <label class="check" title="Scale the time-in-trade bars logarithmically"><input type="checkbox" id="logscale"> Log-scale time bars</label>
+    <label class="check" title="Show a price chart when resting the pointer on a trade (needs a network connection)"><input type="checkbox" id="charts"> Trade charts</label>
     <button class="btn" id="reset">Reset filters</button>
     <span class="pill" id="savedpill" hidden
           title="This view differs from the report's defaults and is remembered in this browser. Reset filters clears it.">saved</span>
@@ -2115,6 +2163,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 const PAYLOAD = /*__DATA__*/ null;
 const TRADES  = PAYLOAD.trades;
 const MARKETS = PAYLOAD.markets || {};
+// Trade → index into TRADES, so a table row can name its trade in a data
+// attribute. The filters pass the same objects through, never copies.
+const TRADE_IX = new Map(TRADES.map((t, i) => [t, i]));
 
 /* The market and timeframe a strategy trades, e.g. "BTCUSDT 15s". Set faintly
    and small beside the name: it identifies the strategy but is constant for all
@@ -2555,10 +2606,15 @@ function renderBody(rows, win) {
    bubble; renderBody() rebinds after every render, which is also how the
    expand handlers above work.                                                 */
 function bindTradeMarkers(root) {
+  closeChart();                                // its row was just replaced
   root.querySelectorAll(".detailbox").forEach(box => {
-    box.querySelectorAll("tr[data-mx0]").forEach(tr => {
-      tr.onmouseenter = () => showMark(box, tr);
-      tr.onmouseleave = () => clearMark(box);
+    // Every row gets the trade chart; only rows placed on the timeline (data-mx0)
+    // also drive the curve marker.
+    box.querySelectorAll("tr[data-ti]").forEach(tr => {
+      const onCurve = tr.dataset.mx0 !== undefined;
+      tr.onmouseenter = e => { if (onCurve) showMark(box, tr); chartHover(tr, e); };
+      tr.onmouseleave = () => { if (onCurve) clearMark(box); chartLeave(tr); };
+      tr.onclick = e => chartPin(tr, e);
     });
     // Month columns join in: hovering one marks the first trade counted in that
     // month (if the filter lets it into the table), clicking one filters to it.
@@ -2588,6 +2644,280 @@ function bindTradeMarkers(root) {
     plot.onmouseleave = () => clearMark(box);
   });
 }
+
+/* ── Trade chart ──────────────────────────────────────────────────────────────
+   Resting the pointer on a trade row shows the market's candles around that
+   trade in a popover; a click pins it (Esc, ✕ or a second click closes it).
+   Candles come live from Bybit's public kline API: the exchange the bot trades
+   on, so entry and exit sit on the very candles the strategy saw. TradingView's
+   Lightweight Charts draws them, fetched from the CDN on first use — a report
+   nobody hovers stays fully offline.                                          */
+const CHART_LIB   = PAYLOAD.config.chartLib || "";
+const SYMBOLS     = PAYLOAD.symbols || {};
+const TIMEFRAMES  = PAYLOAD.timeframes || {};
+const CHART_DELAY = PAYLOAD.config.chartDelay ?? 250;   // ms of hover before fetching (HTML_CHART_HOVER_MS)
+const CHART_BARS  = 120;    // most candles the trade itself may span before the interval steps up
+const CHART_MIN   = 80;     // fewest candles in view; short trades get more context around them
+const CHART_PAD   = 30;     // candles before entry and after exit, at least
+// Bybit's kline intervals in minutes; 1440 is sent as "D".
+const BYBIT_IVS   = [1, 3, 5, 15, 30, 60, 120, 240, 360, 720, 1440];
+
+let chartEl = null, chartObj = null, chartRow = null, chartX = 0;
+let chartPinned = false, chartTimer = 0, chartSeq = 0, chartLibP = null;
+const candleCache = new Map();
+
+function loadChartLib() {
+  if (!chartLibP) chartLibP = new Promise((ok, fail) => {
+    const s = document.createElement("script");
+    s.src = CHART_LIB;
+    s.onload = () => window.LightweightCharts ? ok(window.LightweightCharts)
+                                              : fail(new Error("The chart library did not load."));
+    s.onerror = () => {
+      s.remove();
+      chartLibP = null;                        // let a later hover retry
+      fail(new Error("Could not load the chart library — offline?"));
+    };
+    document.head.appendChild(s);
+  });
+  return chartLibP;
+}
+
+/* Strategy timeframe in whole minutes, at least 1: Bybit has nothing finer, so
+   a 15s strategy is shown on 1m candles. */
+function tfMinutes(tf) {
+  const m = /^(\d+)\s*([smhdw]?)$/i.exec(tf || "");
+  if (!m) return 1;
+  const unit = { s: 1 / 60, m: 1, h: 60, d: 1440, w: 10080 }[(m[2] || "m").toLowerCase()];
+  return Math.max(1, Math.ceil(+m[1] * unit));
+}
+
+/* Candle interval and bar-aligned time range (UTC epoch seconds) for a trade:
+   the strategy's own timeframe, stepped up until the trade fits CHART_BARS, with
+   padding either side. An open trade runs to now. */
+function chartWindow(t) {
+  const now = Math.floor(Date.now() / 1000);
+  const e1 = t.e1 ?? now;
+  const fits = BYBIT_IVS.filter(v => v >= tfMinutes(TIMEFRAMES[t.s]));
+  const iv = fits.find(v => (e1 - t.e0) / (v * 60) <= CHART_BARS) ?? fits[fits.length - 1] ?? 1440;
+  const ivs = iv * 60;
+  const bars = Math.ceil((e1 - t.e0) / ivs);
+  const pad = Math.max(CHART_PAD, Math.ceil((CHART_MIN - bars) / 2));
+  return { iv, ivs,
+           start: (Math.floor(t.e0 / ivs) - pad) * ivs,
+           end:   Math.min(now, (Math.floor(e1 / ivs) + pad + 1) * ivs) };
+}
+
+/* Bybit returns up to 1000 candles newest first, as strings. The promise itself
+   is cached, so a hover that repeats while the first request is in flight
+   shares it; a failure is dropped from the cache so the next hover retries. */
+function fetchCandles(symbol, w) {
+  const key = [symbol, w.iv, w.start, w.end].join("|");
+  if (!candleCache.has(key)) {
+    const q = new URLSearchParams({
+      // Only USDT/USDC contracts are "linear"; BTCUSD and friends are inverse.
+      category: /USD$/.test(symbol) ? "inverse" : "linear",
+      symbol, interval: w.iv === 1440 ? "D" : String(w.iv),
+      start: w.start * 1000, end: w.end * 1000 - 1, limit: 1000,
+    });
+    const p = fetch("https://api.bybit.com/v5/market/kline?" + q)
+      .catch(() => { throw new Error("Could not reach Bybit — offline?"); })
+      .then(r => { if (!r.ok) throw new Error(`Bybit answered HTTP ${r.status}.`); return r.json(); })
+      .then(j => {
+        if (j.retCode !== 0) throw new Error(`Bybit: ${j.retMsg || "error " + j.retCode} (${symbol})`);
+        return j.result.list.map(k => ({ time: k[0] / 1000, open: +k[1], high: +k[2], low: +k[3], close: +k[4] }))
+                            .reverse();
+      });
+    p.catch(() => candleCache.delete(key));
+    candleCache.set(key, p);
+  }
+  return candleCache.get(key);
+}
+
+function chartBox() {
+  if (!chartEl) {
+    chartEl = document.createElement("div");
+    chartEl.className = "tchart";
+    chartEl.hidden = true;
+    chartEl.innerHTML = `<div class="tchead"><b></b><span class="dim"></span>
+      <button class="tcclose" type="button" title="Close (Esc)">✕</button></div>
+      <div class="tcplot"><div class="tcmsg"></div></div><div class="tclegend"></div>`;
+    chartEl.querySelector(".tcclose").onclick = closeChart;
+    document.body.appendChild(chartEl);
+  }
+  return chartEl;
+}
+
+const chartMsg = text => { chartEl.querySelector(".tcmsg").textContent = text; };
+
+/* Off when the viewer unticked "Trade charts", or the report was built without a
+   chart library URL. */
+const chartsOn = () => !!CHART_LIB && $("charts").checked;
+
+function chartHover(tr, e) {
+  if (!chartsOn() || chartPinned) return;
+  clearTimeout(chartTimer);
+  chartTimer = setTimeout(() => openChart(tr, e.clientX, false), CHART_DELAY);
+}
+
+function chartLeave(tr) {
+  clearTimeout(chartTimer);
+  if (!chartPinned && chartRow === tr) closeChart();
+}
+
+function chartPin(tr, e) {
+  if (!chartsOn()) return;
+  clearTimeout(chartTimer);
+  if (chartPinned && chartRow === tr) closeChart();
+  else openChart(tr, e.clientX, true);
+}
+
+function openChart(tr, x, pin) {
+  const t = TRADES[+tr.dataset.ti];
+  if (!t) return;
+  const el = chartBox();
+  if (chartRow) chartRow.classList.remove("pinned");
+  chartPinned = pin;
+  el.classList.toggle("pinned", pin);
+  tr.classList.toggle("pinned", pin);
+  // Hovered, then clicked: the chart on screen is already this trade's.
+  if (chartRow === tr && !el.hidden) return;
+
+  const seq = ++chartSeq;                      // results for any earlier row are now stale
+  if (chartObj) { chartObj.remove(); chartObj = null; }
+  chartRow = tr;
+  chartX = x;
+  const sym = SYMBOLS[t.s];
+  const w = t.e0 == null ? null : chartWindow(t);
+  const ivLabel = !w ? "" : w.iv < 60 ? w.iv + "m" : w.iv < 1440 ? w.iv / 60 + "h" : "1D";
+  el.querySelector(".tchead b").textContent = (sym || t.s) + (w ? ` · ${ivLabel} candles` : "");
+  el.querySelector(".tchead .dim").textContent = `${t.s} · ${t.t0} → ${t.t1 || "open"}`;
+  el.querySelector(".tclegend").innerHTML = "";
+  el.hidden = false;
+  placeChart();
+
+  if (!sym) { chartMsg("The log does not say which market this strategy trades."); return; }
+  if (!w)   { chartMsg("This trade has no usable entry time."); return; }
+  chartMsg("Loading chart…");
+  Promise.all([loadChartLib(), fetchCandles(sym, w)])
+    .then(([LWC, candles]) => {
+      if (seq !== chartSeq) return;
+      if (!candles.length) { chartMsg("Bybit has no candles for this period."); return; }
+      chartMsg("");
+      drawTradeChart(LWC, t, w, candles);
+      placeChart();                            // the legend may have changed the height
+    })
+    .catch(err => { if (seq === chartSeq) chartMsg(err.message || String(err)); });
+}
+
+function closeChart() {
+  clearTimeout(chartTimer);
+  ++chartSeq;
+  if (chartObj) { chartObj.remove(); chartObj = null; }
+  if (chartRow) chartRow.classList.remove("pinned");
+  chartRow = null;
+  chartPinned = false;
+  if (chartEl) { chartEl.hidden = true; chartEl.classList.remove("pinned"); }
+}
+
+/* Below the row, or above it when the viewport has no room there; centred on
+   the pointer horizontally, clamped to the viewport either way. */
+function placeChart() {
+  if (!chartEl || chartEl.hidden || !chartRow) return;
+  if (!chartRow.isConnected) { closeChart(); return; }
+  const r = chartRow.getBoundingClientRect();
+  const w = chartEl.offsetWidth, h = chartEl.offsetHeight, m = 8;
+  let top = r.bottom + 6;
+  if (top + h > innerHeight - m) top = r.top - h - 6;
+  top = Math.max(m, Math.min(top, innerHeight - h - m));
+  chartEl.style.top  = top + "px";
+  chartEl.style.left = Math.max(m, Math.min(chartX - w / 2, innerWidth - w - m)) + "px";
+}
+
+function drawTradeChart(LWC, t, w, candles) {
+  const css = getComputedStyle(document.documentElement);
+  const v = name => css.getPropertyValue(name).trim();
+  const [green, red, muted, accent, text, panel, border] =
+    ["--green", "--red", "--muted", "--accent", "--text", "--panel", "--border"].map(v);
+
+  // The chart's time axis shows the log's own clock, so it reads the same as the
+  // Entry/Exit times in the table: shift by that trade's clock-vs-UTC offset.
+  const off = Date.parse(t.t0.replace(" ", "T") + "Z") / 1000 - t.e0;
+  const barAt = e => Math.floor(e / w.ivs) * w.ivs + off;
+
+  const tp = t.d && t.rw !== null ? t.p0 * (1 + t.d * t.rw / 100) : null;
+  const sl = t.d && t.rk !== null ? t.p0 * (1 - t.d * t.rk / 100) : null;
+  const levels = [t.p0, t.p1, tp, sl].filter(p => p !== null && isFinite(p));
+  const ref = t.p0 || candles[0].close;
+  const prec = ref >= 10000 ? 1 : ref >= 10 ? 2 : ref >= 1 ? 3 : 5;
+  // Green and red stay reserved for outcome, as everywhere else in the report,
+  // so the candles themselves are neutral: hollow up, filled down.
+  const outcome = t.w === true ? green : t.w === false ? red : muted;
+
+  const chart = LWC.createChart(chartEl.querySelector(".tcplot"), {
+    autoSize: true,
+    layout: { background: { type: "solid", color: panel }, textColor: muted, fontSize: 10.5,
+              fontFamily: getComputedStyle(document.body).fontFamily },
+    grid: { vertLines: { color: border }, horzLines: { color: border } },
+    rightPriceScale: { borderColor: border },
+    timeScale: { borderColor: border, timeVisible: true, secondsVisible: false },
+    crosshair: { mode: LWC.CrosshairMode.Normal },
+  });
+  const series = chart.addCandlestickSeries({
+    upColor: panel, downColor: muted, borderUpColor: muted, borderDownColor: muted,
+    wickUpColor: muted, wickDownColor: muted,
+    priceLineVisible: false, lastValueVisible: false,
+    priceFormat: { type: "price", precision: prec, minMove: 10 ** -prec },
+    // Keep entry, exit, TP and SL in view even when price never got there.
+    autoscaleInfoProvider: base => {
+      const r = base();
+      if (r && levels.length) {
+        r.priceRange.minValue = Math.min(r.priceRange.minValue, ...levels);
+        r.priceRange.maxValue = Math.max(r.priceRange.maxValue, ...levels);
+      }
+      return r;
+    },
+  });
+  series.setData(candles.map(c => ({ ...c, time: c.time + off })));
+
+  const line = (price, color, title, style) => series.createPriceLine(
+    { price, color, title, lineWidth: 1, lineStyle: style, axisLabelVisible: true });
+  if (tp !== null) line(tp, green, "TP", LWC.LineStyle.Dashed);
+  if (sl !== null) line(sl, red, "SL", LWC.LineStyle.Dashed);
+  if (t.p0 !== null) line(t.p0, accent, "Entry", LWC.LineStyle.Solid);
+  if (t.p1 !== null) line(t.p1, outcome, "Exit", LWC.LineStyle.Solid);
+
+  const markers = [{ time: barAt(t.e0), color: accent,
+                     position: t.d === -1 ? "aboveBar" : "belowBar",
+                     shape: t.d === -1 ? "arrowDown" : "arrowUp",
+                     text: t.d === 1 ? "Long" : t.d === -1 ? "Short" : "Entry" }];
+  if (t.e1 !== null && t.x) {
+    markers.push({ time: barAt(t.e1), color: outcome, shape: "circle", text: t.x,
+                   position: t.p1 !== null && t.p0 !== null && t.p1 < t.p0 ? "belowBar" : "aboveBar" });
+  }
+  series.setMarkers(markers);                  // already in time order
+  chart.timeScale().fitContent();
+  chartObj = chart;
+
+  // The chart's own precision rather than fmtPrice(): two decimals flatten every
+  // DOGE level to "0.08".
+  const fmt = p => p.toLocaleString("en-US", { minimumFractionDigits: prec, maximumFractionDigits: prec });
+  const key = (color, label, price, dash) => price === null ? "" :
+    `<span><i class="${dash ? "dash" : ""}" style="border-color:${color}"></i>${esc(label)} ${fmt(price)}</span>`;
+  chartEl.querySelector(".tclegend").innerHTML =
+    key(accent, "Entry", t.p0) + key(outcome, "Exit" + (t.x ? ` (${t.x})` : ""), t.p1) +
+    key(green, "TP", tp, true) + key(red, "SL", sl, true) +
+    (t.mv === null ? "" : `<span style="color:${t.mv >= 0 ? green : red}">Move ${signed(t.mv / 100)}</span>`);
+}
+
+addEventListener("scroll", placeChart, true);  // capture: the trade table scrolls on its own too
+addEventListener("resize", placeChart);
+document.addEventListener("keydown", e => {
+  if (e.key === "Escape" && chartEl && !chartEl.hidden) closeChart();
+});
+// A click anywhere else lets go of a pinned chart.
+document.addEventListener("click", e => {
+  if (chartPinned && !chartEl.contains(e.target) && !e.target.closest("tr[data-ti]")) closeChart();
+});
 
 /* The rows' data-mx* attributes are already an interval index over the
    timeline, so the reverse lookup reads them back instead of keeping a second
@@ -3126,7 +3456,7 @@ function detailHtml(r, win) {
     const pl   = t.w === true ? `<span class="pos">Profit</span>`
                : t.w === false ? `<span class="neg">Loss</span>` : `<span class="dim">—</span>`;
     const size = (t.q !== null && t.l !== null) ? t.q.toFixed(2) + "% × " + t.l : "—";
-    return `<tr${markAttrs(t)}>
+    return `<tr${markAttrs(t)} data-ti="${TRADE_IX.get(t)}">
       <td>${n}</td>
       <td>${esc(t.t0)}</td>
       <td>${dir}</td>
@@ -3461,10 +3791,12 @@ function saveState() {
   writeStore({
     q: $("q").value, from: $("from").value, to: $("to").value,
     logscale: $("logscale").checked,
+    charts: $("charts").checked,
     sortKey, sortDir,
     // The defaults in force when this was saved, so changes to them can win later.
     was: { sortKey: DEFAULT_SORT_KEY, sortDir: DEFAULT_SORT_DIR,
-           logScale: PAYLOAD.config.logScale, dayMin: DAY_MIN, dayMax: DAY_MAX,
+           logScale: PAYLOAD.config.logScale, tradeChart: PAYLOAD.config.tradeChart,
+           dayMin: DAY_MIN, dayMax: DAY_MAX,
            defaultFrom: DEFAULT_FROM },
   });
 }
@@ -3481,6 +3813,7 @@ function loadState() {
   $("from").value = (s.from && s.from !== wasFrom) ? s.from : DEFAULT_FROM;
   $("to").value   = (s.to   && s.to   !== s.was.dayMax) ? s.to   : DAY_MAX;
   if (s.was.logScale === PAYLOAD.config.logScale) $("logscale").checked = !!s.logscale;
+  if (s.was.tradeChart === PAYLOAD.config.tradeChart) $("charts").checked = !!s.charts;
   if (s.was.sortKey === DEFAULT_SORT_KEY && s.was.sortDir === DEFAULT_SORT_DIR
       && COLS.some(c => c.key === s.sortKey)) {
     sortKey = s.sortKey;
@@ -3494,6 +3827,7 @@ function applyDefaults() {
   $("from").value = DEFAULT_FROM;
   $("to").value   = DAY_MAX;
   $("logscale").checked  = PAYLOAD.config.logScale;
+  $("charts").checked    = PAYLOAD.config.tradeChart;
   sortKey = DEFAULT_SORT_KEY;
   sortDir = DEFAULT_SORT_DIR;
 }
@@ -3504,6 +3838,7 @@ function viewIsCustom() {
   return nameTerms().length > 0
       || $("from").value !== DEFAULT_FROM || $("to").value !== DAY_MAX
       || $("logscale").checked !== PAYLOAD.config.logScale
+      || $("charts").checked !== PAYLOAD.config.tradeChart
       || sortKey !== DEFAULT_SORT_KEY || sortDir !== DEFAULT_SORT_DIR;
 }
 
@@ -3515,6 +3850,7 @@ function resetFilters() {
 
 ["q", "from", "to"].forEach(id => $(id).addEventListener("input", render));
 $("logscale").addEventListener("change", render);
+$("charts").addEventListener("change", render);      // render() also closes an open chart
 $("reset").onclick = resetFilters;
 
 $("meta").textContent = PAYLOAD.meta.summary;
@@ -3546,6 +3882,17 @@ if (PAYLOAD.config.expandTop && lastRowNames.length) {
 """
 
 
+def to_epoch(ts: Optional[datetime]) -> Optional[int]:
+    """A naive log timestamp as UTC epoch seconds, per LOG_UTC_OFFSET_HOURS."""
+    if ts is None:
+        return None
+    if LOG_UTC_OFFSET_HOURS is None:
+        # astimezone() on a naive datetime assumes system local time, with the
+        # DST rule for that date — and needs no tzdata package on Windows.
+        return int(ts.astimezone().timestamp())
+    return int(ts.replace(tzinfo=timezone(timedelta(hours=LOG_UTC_OFFSET_HOURS))).timestamp())
+
+
 def trade_to_dict(t: Trade) -> dict:
     """Flatten a Trade for the browser. `day` is used for timezone-free date filtering."""
     return {
@@ -3555,6 +3902,9 @@ def trade_to_dict(t: Trade) -> dict:
         # here and the strings are still sortable and parseable as-is.
         "t0":  t.entry_time.strftime("%Y-%m-%d %H:%M:%S"),
         "t1":  t.exit_time.strftime("%Y-%m-%d %H:%M:%S") if t.exit_time else None,
+        # The same instants as UTC epoch seconds, for fetching the trade chart.
+        "e0":  to_epoch(t.entry_time),
+        "e1":  to_epoch(t.exit_time),
         "x":   t.exit_type,
         "d":   t.direction,
         "p0":  t.entry_price,
@@ -3643,11 +3993,18 @@ def write_html_report(all_stats: dict[str, StrategyStats], out_path: str, files:
             "logScale":    bool(HTML_LOG_SCALE_DURATION),
             "tradingDays": TRADING_DAYS_PER_YEAR,
             "defaultFrom": default_from,      # "" = earliest day in the data
+            "tradeChart":  bool(HTML_TRADE_CHART),
+            "chartLib":    HTML_CHART_LIB_URL,
+            "chartDelay":  max(0, int(HTML_CHART_HOVER_MS)),
         },
         # Per strategy, not per trade: the market and timeframe come from the
         # strategy's first entry signal and are the same for all of its trades,
         # so shipping them once each keeps them out of 2000 trade records.
         "markets": {s.name: s.market_label for s in all_stats.values() if s.market_label},
+        # The raw values behind those labels, which the trade chart's candle
+        # request needs: "BTCUSDT" and "15s", not "BTC 15s".
+        "symbols":    {s.name: s.market for s in all_stats.values() if s.market},
+        "timeframes": {s.name: s.timeframe for s in all_stats.values() if s.timeframe},
         "meta": {
             "summary": "  ·  ".join(bits),
             "files":   [os.path.basename(f) for f in files],
